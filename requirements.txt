@@ -1,0 +1,34 @@
+# ============================================
+# RAG Claim Attribution System - Dependencies
+# ============================================
+
+# --- UI Framework ---
+streamlit>=1.30.0
+
+# --- LLM Integration (Ollama) ---
+ollama>=0.4.0
+requests>=2.31.0
+
+# --- Vector Database & Embeddings ---
+chromadb>=0.4.22
+sentence-transformers>=2.3.0
+
+# --- Wikipedia Data Source ---
+wikipedia-api>=0.6.0
+
+# --- NLP & Segmentation ---
+spacy>=3.7.0
+nltk>=3.8.1
+
+# --- Attribution Metrics ---
+bert-score>=0.3.13
+rouge-score>=0.1.2
+numpy>=1.24.0
+
+# --- Utilities ---
+pandas>=2.0.0
+tqdm>=4.66.0
+
+# --- Testing & Evaluation ---
+pytest>=7.4.0
+datasets>=2.16.0          # Per caricare RAG-RewardBench da HuggingFace

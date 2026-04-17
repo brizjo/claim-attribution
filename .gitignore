@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Models
+data/*.json
+data/*.csv
+*.bin
+*.pt
+
+# ChromaDB persistence
+chroma_db/
+
+# Distribution
+dist/
+build/
+*.egg-info/
