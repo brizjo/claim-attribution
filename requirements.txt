@@ -1,34 +1,37 @@
 # ============================================
-# RAG Claim Attribution System - Dependencies
+# RAG Claim Attribution — LPG/Neo4j Stack
 # ============================================
 
-# --- UI Framework ---
+# --- UI ---
 streamlit>=1.30.0
 
-# --- LLM Integration (Ollama) ---
-ollama>=0.4.0
-requests>=2.31.0
+# --- Neo4j driver ---
+neo4j>=5.0.0
 
-# --- Vector Database & Embeddings ---
-chromadb>=0.4.22
+# --- LLM (Ollama / coreference) ---
+requests>=2.31.0
+fastcoref>=2.1.6
+
+# --- Triple extraction (mREBEL) ---
+transformers>=4.35.0
+torch>=2.0.0
+sentencepiece>=0.2.0   # required by mBART tokenizer for mREBEL
+
+# --- Predicate embeddings ---
 sentence-transformers>=2.3.0
 
-# --- Wikipedia Data Source ---
-wikipedia-api>=0.6.0
+# --- PDF parsing ---
+PyMuPDF>=1.23.0
 
-# --- NLP & Segmentation ---
-spacy>=3.7.0
-nltk>=3.8.1
-
-# --- Attribution Metrics ---
-bert-score>=0.3.13
-rouge-score>=0.1.2
+# --- Numerics ---
 numpy>=1.24.0
 
-# --- Utilities ---
-pandas>=2.0.0
+# --- Legacy (kept for old modules) ---
+chromadb>=1.0.0
+datasets>=2.16.0
+spacy>=3.7.0
+rouge-score>=0.1.2
 tqdm>=4.66.0
 
-# --- Testing & Evaluation ---
+# --- Testing ---
 pytest>=7.4.0
-datasets>=2.16.0          # Per caricare RAG-RewardBench da HuggingFace

@@ -1,225 +1,95 @@
 """
-RAG Claim Attribution System — Interfaccia Streamlit.
+Claim Attribution — LPG/Neo4j Streamlit App.
 
-Applicazione principale che orchestra la pipeline completa:
-1. Input query utente
-2. Retrieval da Wikipedia (ChromaDB)
-3. Generazione con Llama-3 (Ollama)
-4. Segmentazione sentence-level
-5. Calcolo matrice di supporto (BERTScore + ROUGE-L)
-6. Visualizzazione Highlight Gradient
+Tab 1 — Ingest: upload PDF/TXT → clean (Llama-3) → extract triples (REBEL) → Neo4j
+Tab 2 — Claim Attribution: input claim → exact match / semantic fallback → source
 
-Avvio: streamlit run app.py
+Run: streamlit run app.py
 """
 
+import os
 import sys
 from pathlib import Path
 
-# Aggiungi la root del progetto al path
 sys.path.insert(0, str(Path(__file__).parent))
 
+os.environ["HF_HOME"] = r"D:\hf_home"
+os.environ["HF_HUB_CACHE"] = r"D:\hf_home\hub"
+os.environ["HUGGINGFACE_HUB_CACHE"] = r"D:\hf_home\hub"
+os.environ["TRANSFORMERS_CACHE"] = r"D:\hf_home\transformers"
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = r"D:\hf_home\sentence_transformers"
+os.environ["HF_DATASETS_CACHE"] = r"D:\hf_home\datasets"
+os.environ["TORCH_HOME"] = r"D:\hf_home\torch"
+
 import streamlit as st
-import numpy as np
 
 from config import settings
-from src.retriever.wiki_retriever import WikiRetriever
-from src.generator.llama_generator import LlamaGenerator
-from src.segmentation.sentence_splitter import SentenceSplitter
-from src.attribution.matrix import SupportMatrix
-from src.visualization.highlight_renderer import HighlightRenderer
-
-
-# ====================================================================
-# Page Configuration
-# ====================================================================
 
 st.set_page_config(
-    page_title="RAG Claim Attribution",
-    page_icon="🔍",
+    page_title="Claim Attribution",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ====================================================================
-# Custom CSS — Dark Premium Theme
-# ====================================================================
-
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
-    /* Global */
-    .stApp {
-        font-family: 'Inter', sans-serif;
-    }
-
-    /* Header */
-    .main-header {
-        text-align: center;
-        padding: 2rem 0 1rem;
-    }
-    .main-header h1 {
-        font-size: 2.4rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #6366f1, #8b5cf6, #a78bfa);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.3rem;
-    }
-    .main-header p {
-        color: #94a3b8;
-        font-size: 1rem;
-        font-weight: 300;
-    }
-
-    /* Status badges */
-    .status-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-size: 0.8rem;
-        font-weight: 500;
-    }
-    .status-online {
-        background: rgba(16, 185, 129, 0.15);
-        color: #10b981;
-        border: 1px solid rgba(16, 185, 129, 0.3);
-    }
-    .status-offline {
-        background: rgba(239, 68, 68, 0.15);
-        color: #ef4444;
-        border: 1px solid rgba(239, 68, 68, 0.3);
-    }
-
-    /* Cards */
-    .info-card {
-        background: rgba(30, 41, 59, 0.5);
-        border: 1px solid rgba(148, 163, 184, 0.1);
-        border-radius: 12px;
-        padding: 1.2rem;
-        margin: 0.5rem 0;
-        backdrop-filter: blur(8px);
-    }
-    .info-card h4 {
-        color: #e2e8f0;
-        margin-bottom: 0.5rem;
-        font-weight: 600;
-    }
-    .info-card p {
-        color: #94a3b8;
-        font-size: 0.9rem;
-        line-height: 1.6;
-    }
-
-    /* Context documents */
-    .context-doc {
-        background: rgba(30, 41, 59, 0.4);
-        border-left: 3px solid #6366f1;
-        padding: 0.8rem 1rem;
-        margin: 0.5rem 0;
-        border-radius: 0 8px 8px 0;
-        font-size: 0.88rem;
-        line-height: 1.6;
-        color: #cbd5e1;
-    }
-    .context-source {
-        color: #818cf8;
-        font-size: 0.78rem;
-        font-weight: 500;
-        margin-top: 0.4rem;
-    }
-
-    /* Metrics row */
-    .metric-container {
-        display: flex;
-        gap: 1rem;
-        margin: 1rem 0;
-    }
-    .metric-box {
-        flex: 1;
-        background: rgba(30, 41, 59, 0.6);
-        border: 1px solid rgba(148, 163, 184, 0.1);
-        border-radius: 10px;
-        padding: 1rem;
-        text-align: center;
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        margin: 0.3rem 0;
-    }
-    .metric-label {
-        font-size: 0.78rem;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* Pipeline step indicators */
-    .pipeline-steps {
-        display: flex;
-        justify-content: center;
-        gap: 0.5rem;
-        margin: 1rem 0;
-        flex-wrap: wrap;
-    }
-    .pipeline-step {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 14px;
-        border-radius: 20px;
-        font-size: 0.78rem;
-        font-weight: 500;
-        background: rgba(99, 102, 241, 0.1);
-        border: 1px solid rgba(99, 102, 241, 0.2);
-        color: #a5b4fc;
-    }
-    .pipeline-step.active {
-        background: rgba(99, 102, 241, 0.25);
-        border-color: rgba(99, 102, 241, 0.5);
-        color: #c7d2fe;
-    }
-
-    /* Divider */
-    .section-divider {
-        border: none;
-        height: 1px;
-        background: linear-gradient(90deg, transparent, rgba(148,163,184,0.2), transparent);
-        margin: 1.5rem 0;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+.stApp { font-family: 'Inter', sans-serif; }
+.main-header { text-align:center; padding:1.5rem 0 0.5rem; }
+.main-header h1 {
+    font-size:2.2rem; font-weight:700;
+    background:linear-gradient(135deg,#6366f1,#a78bfa);
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+}
+.badge-online  { display:inline-block; padding:3px 12px; border-radius:20px;
+    background:rgba(16,185,129,.15); color:#10b981;
+    border:1px solid rgba(16,185,129,.3); font-size:.8rem; font-weight:500; }
+.badge-offline { display:inline-block; padding:3px 12px; border-radius:20px;
+    background:rgba(239,68,68,.15); color:#ef4444;
+    border:1px solid rgba(239,68,68,.3); font-size:.8rem; font-weight:500; }
+.card {
+    background:rgba(30,41,59,.5); border:1px solid rgba(148,163,184,.1);
+    border-radius:12px; padding:1.2rem; margin:.5rem 0; }
+.card h4 { color:#e2e8f0; margin-bottom:.5rem; font-weight:600; }
+.card p  { color:#94a3b8; font-size:.9rem; line-height:1.6; }
+.triple-tag {
+    display:inline-block; background:rgba(99,102,241,.15);
+    border:1px solid rgba(99,102,241,.3); border-radius:8px;
+    padding:2px 10px; color:#a5b4fc; font-size:.82rem; margin:2px; }
+.triple-tag-answer {
+    display:inline-block; background:rgba(16,185,129,.2);
+    border:1px solid rgba(16,185,129,.5); border-radius:8px;
+    padding:2px 10px; color:#34d399; font-size:.82rem; margin:2px;
+    font-weight:600; box-shadow:0 0 8px rgba(16,185,129,.3); }
+.result-exact    { background:rgba(16,185,129,.1);  border-left:4px solid #10b981; padding:1rem; border-radius:0 10px 10px 0; }
+.result-semantic { background:rgba(245,158,11,.1);  border-left:4px solid #f59e0b; padding:1rem; border-radius:0 10px 10px 0; }
+.result-notfound { background:rgba(239,68,68,.1);   border-left:4px solid #ef4444; padding:1rem; border-radius:0 10px 10px 0; }
+.chunk-box {
+    background:rgba(15,23,42,.6); border:1px solid rgba(99,102,241,.2);
+    border-radius:8px; padding:1rem; font-size:.9rem; line-height:1.7;
+    color:#cbd5e1; font-style:italic; margin-top:.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ====================================================================
-# Cached Initialization
+# Cached resources
 # ====================================================================
 
 @st.cache_resource
-def init_retriever():
-    """Inizializza il retriever (cached per sessione)."""
-    return WikiRetriever()
+def get_neo4j_client():
+    try:
+        from src.graph.neo4j_client import Neo4jClient
+        return Neo4jClient()
+    except Exception as e:
+        return None
 
 
 @st.cache_resource
-def init_generator():
-    """Inizializza il generator (cached per sessione)."""
-    return LlamaGenerator()
-
-
-@st.cache_resource
-def init_splitter():
-    """Inizializza il sentence splitter (cached per sessione)."""
-    return SentenceSplitter()
-
-
-@st.cache_resource
-def init_renderer():
-    """Inizializza il renderer (cached per sessione)."""
-    return HighlightRenderer()
+def get_generator(model_name: str = settings.OLLAMA_MODEL):
+    from src.generator.llama_generator import LlamaGenerator
+    return LlamaGenerator(model=model_name)
 
 
 # ====================================================================
@@ -228,323 +98,439 @@ def init_renderer():
 
 st.markdown("""
 <div class="main-header">
-    <h1>🔍 RAG Claim Attribution</h1>
-    <p>Post-Retrieval attribution with highlight gradient visualization</p>
+    <h1>🧠 Claim Attribution — LPG/Neo4j</h1>
 </div>
 """, unsafe_allow_html=True)
 
-# Pipeline steps
-st.markdown("""
-<div class="pipeline-steps">
-    <span class="pipeline-step">📥 Retrieval</span>
-    <span class="pipeline-step">→</span>
-    <span class="pipeline-step">🤖 Generation</span>
-    <span class="pipeline-step">→</span>
-    <span class="pipeline-step">✂️ Segmentation</span>
-    <span class="pipeline-step">→</span>
-    <span class="pipeline-step">📊 Attribution Matrix</span>
-    <span class="pipeline-step">→</span>
-    <span class="pipeline-step">🎨 Highlight</span>
-</div>
-<hr class="section-divider">
-""", unsafe_allow_html=True)
 
 # ====================================================================
-# Sidebar — Configuration & Status
+# Sidebar — status
 # ====================================================================
 
 with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
+    st.markdown("### System Status")
 
-    # Model status
-    generator = init_generator()
-    ollama_status = generator.is_available()
-    if ollama_status:
-        st.markdown(
-            '<span class="status-badge status-online">● Ollama Online</span>',
-            unsafe_allow_html=True,
-        )
+    neo4j = get_neo4j_client()
+    if neo4j and neo4j.is_connected():
+        st.markdown('<span class="badge-online">● Neo4j Connected</span>', unsafe_allow_html=True)
+        stats = neo4j.stats()
+        st.caption(f"Entities: **{stats['nodes']}** | Relations: **{stats['relations']}**")
+        active_db = getattr(neo4j, "database", None)
+        if active_db:
+            st.caption(f"DB attiva: `{active_db}` — assicurati che Browser punti qui")
+        list_dbs = getattr(neo4j, "list_databases", None)
+        if callable(list_dbs):
+            dbs = list_dbs()
+            if dbs:
+                st.caption(f"DB visibili: {', '.join(dbs)}")
+        if st.button("♻️ Reload Neo4j Client"):
+            get_neo4j_client.clear()
+            st.rerun()
     else:
-        st.markdown(
-            '<span class="status-badge status-offline">● Ollama Offline</span>',
-            unsafe_allow_html=True,
+        st.markdown('<span class="badge-offline">● Neo4j Offline</span>', unsafe_allow_html=True)
+        st.warning(
+            "Start Neo4j Desktop, open a database, then set:\n"
+            "```\nNEO4J_PASSWORD=yourpass\n```\nin your environment."
         )
-        st.warning("Avvia Ollama con: `ollama serve`")
+        if st.button("🔄 Retry Connection"):
+            get_neo4j_client.clear()
+            st.rerun()
 
     st.markdown("---")
-
-    # Parametri configurabili
-    st.markdown("#### 📐 Retrieval")
-    top_k = st.slider("Top-K documents", 1, 10, settings.TOP_K_DOCUMENTS)
-
-    st.markdown("#### 🧮 Attribution Weights")
-    w_bert = st.slider(
-        "BERTScore weight",
-        0.0, 1.0, settings.WEIGHT_BERTSCORE, 0.05,
-    )
-    w_lex = st.slider(
-        "Lexical weight",
-        0.0, 1.0, settings.WEIGHT_LEXICAL_OVERLAP, 0.05,
-    )
-
-    st.markdown("#### 🎨 Thresholds")
-    th_high = st.slider(
-        "High support ≥", 0.0, 1.0, settings.SUPPORT_THRESHOLD_HIGH, 0.05
-    )
-    th_med = st.slider(
-        "Medium support ≥", 0.0, 1.0, settings.SUPPORT_THRESHOLD_MEDIUM, 0.05
-    )
-    th_low = st.slider(
-        "Low support ≥", 0.0, 1.0, settings.SUPPORT_THRESHOLD_LOW, 0.05
-    )
-
-    st.markdown("---")
-
-    # Index building
-    st.markdown("#### 📚 Knowledge Base")
-    st.markdown(f"<span style='font-size:0.8rem;color:#94a3b8'>Dataset: {settings.HF_DATASET_NAME}</span>", unsafe_allow_html=True)
-    if st.button("🔄 Build Dataset Index", use_container_width=True):
-        with st.spinner("Downloading and indexing dataset documents..."):
-            retriever = init_retriever()
-            n_chunks = retriever.build_index()
-            st.success(f"✅ Indexed {n_chunks} chunks")
-
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align:center; color:#64748b; font-size:0.75rem;'>"
-        "RAG Claim Attribution v0.1<br>"
-        "University Research Project"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-# ====================================================================
-# Main Content — Query & Pipeline
-# ====================================================================
-
-# Query input
-query = st.text_input(
-    "🔎 Enter your question",
-    placeholder="e.g., What is retrieval-augmented generation?",
-    help="The system will retrieve relevant Wikipedia documents and generate an attributed answer.",
-)
-
-# Run pipeline
-if query:
-    retriever = init_retriever()
-    splitter = init_splitter()
-    renderer = init_renderer()
-
-    # Override renderer thresholds from sidebar
-    renderer.threshold_high = th_high
-    renderer.threshold_medium = th_med
-    renderer.threshold_low = th_low
-
-    # ── Step 1: Retrieval ──────────────────────────────────────
-    with st.status("📥 Retrieving documents from Wikipedia...", expanded=False) as status:
-        try:
-            retrieved_docs = retriever.query(query, top_k=top_k)
-            if not retrieved_docs:
-                st.warning(
-                    "⚠️ No documents found. Build the index first using the sidebar button."
-                )
-                st.stop()
-            status.update(
-                label=f"📥 Retrieved {len(retrieved_docs)} documents",
-                state="complete",
-            )
-        except Exception as e:
-            status.update(label=f"❌ Retrieval failed: {e}", state="error")
-            st.stop()
-
-    # ── Step 2: Generation ─────────────────────────────────────
-    with st.status("🤖 Generating response with Llama-3...", expanded=False) as status:
-        try:
-            result = generator.run(query, retrieved_docs)
-            generated_response = result["response"]
-            status.update(label="🤖 Response generated", state="complete")
-        except ConnectionError:
-            st.error(
-                "❌ Cannot connect to Ollama. Make sure it's running:\n\n"
-                "```bash\nollama serve\n```"
-            )
-            st.stop()
-        except Exception as e:
-            status.update(label=f"❌ Generation failed: {e}", state="error")
-            st.stop()
-
-    # ── Step 3: Segmentation ───────────────────────────────────
-    with st.status("✂️ Segmenting into sentences...", expanded=False) as status:
-        # Segmenta i documenti di contesto in frasi singole
-        evidence_sentences = splitter.split_documents(retrieved_docs)
-
-        # Estrai fatti atomici dalla risposta generata
-        atomic_facts = splitter.extract_atomic_facts(generated_response)
-
-        status.update(
-            label=f"✂️ {len(evidence_sentences)} evidence sentences, "
-                  f"{len(atomic_facts)} atomic facts",
-            state="complete",
-        )
-
-    # ── Step 4: Attribution Matrix ─────────────────────────────
-    with st.status("📊 Computing support matrix...", expanded=False) as status:
-        support_matrix = SupportMatrix(
-            weight_bertscore=w_bert,
-            weight_lexical=w_lex,
-        )
-        matrix = support_matrix.compute(atomic_facts, evidence_sentences)
-        attribution_results = support_matrix.get_attribution_results()
-        overall_score = support_matrix.get_overall_score()
-
-        status.update(
-            label=f"📊 Attribution complete — Overall: {overall_score*100:.0f}%",
-            state="complete",
-        )
-
-    # ── Step 5: Visualization ──────────────────────────────────
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # Metrics overview
-    n_high = sum(1 for r in attribution_results if r.support_score >= th_high)
-    n_halluc = sum(1 for r in attribution_results if r.support_score < th_low)
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        score_color = renderer._score_to_border(overall_score)
-        st.markdown(
-            f"<div class='metric-box'>"
-            f"<div class='metric-label'>Overall Score</div>"
-            f"<div class='metric-value' style='color:{score_color}'>"
-            f"{overall_score*100:.0f}%</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with col2:
-        st.markdown(
-            f"<div class='metric-box'>"
-            f"<div class='metric-label'>Atomic Facts</div>"
-            f"<div class='metric-value' style='color:#a5b4fc'>"
-            f"{len(atomic_facts)}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with col3:
-        st.markdown(
-            f"<div class='metric-box'>"
-            f"<div class='metric-label'>Well Supported</div>"
-            f"<div class='metric-value' style='color:#10b981'>"
-            f"{n_high}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with col4:
-        st.markdown(
-            f"<div class='metric-box'>"
-            f"<div class='metric-label'>Hallucination Risk</div>"
-            f"<div class='metric-value' style='color:#ef4444'>"
-            f"{n_halluc}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Highlight Gradient Response ────────────────────────────
-    st.markdown("### 🎨 Attributed Response")
-    st.markdown(
-        "<p style='color:#94a3b8; font-size:0.85rem; margin-bottom:1rem;'>"
-        "Hover over each segment to see attribution details. "
-        "Colors indicate the level of source support.</p>",
-        unsafe_allow_html=True,
-    )
-
-    highlighted_html = renderer.render_response(
-        attribution_results, overall_score
-    )
-    st.markdown(highlighted_html, unsafe_allow_html=True)
-
-    # ── Expandable sections ────────────────────────────────────
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # Context documents
-    with st.expander("📄 Retrieved Context Documents", expanded=False):
-        for i, doc in enumerate(retrieved_docs):
-            source = doc.get("metadata", {}).get("source", "Unknown")
-            distance = doc.get("distance", 0)
-            st.markdown(
-                f"<div class='context-doc'>"
-                f"{doc['document']}"
-                f"<div class='context-source'>📌 {source} — "
-                f"Distance: {distance:.4f}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-    # Attribution details table
-    with st.expander("📋 Attribution Details", expanded=False):
-        for i, result in enumerate(attribution_results):
-            score_color = renderer._score_to_border(result.support_score)
-            st.markdown(
-                f"**Fact {i+1}:** {result.fact}\n\n"
-                f"- **Support Score:** "
-                f"<span style='color:{score_color}'>"
-                f"{result.support_score*100:.1f}%</span>\n"
-                f"- **BERTScore F1:** {result.bertscore:.3f}\n"
-                f"- **Lexical (ROUGE-L):** {result.lexical_score:.3f}\n"
-                f"- **Best Evidence:** _{result.best_evidence[:200]}_\n"
-                f"- **Source:** {result.best_evidence_source}\n\n---",
-                unsafe_allow_html=True,
-            )
-
-    # Support Matrix heatmap
-    with st.expander("🧮 Support Matrix Heatmap", expanded=False):
-        if matrix is not None and matrix.size > 0:
-            evidence_labels = [ev["sentence"] for ev in evidence_sentences]
-            heatmap_html = renderer.render_matrix_heatmap(
-                matrix, atomic_facts, evidence_labels
-            )
-            st.markdown(heatmap_html, unsafe_allow_html=True)
+    st.markdown("#### Processed Documents")
+    if neo4j and neo4j.is_connected():
+        docs = neo4j.get_documents()
+        if docs:
+            import pandas as pd
+            df = pd.DataFrame(docs)[["name", "ingested_at", "num_chunks", "num_triples", "status"]]
+            df.columns = ["File", "Ingested At", "Chunks", "Triples", "Status"]
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
-            st.info("No matrix data available.")
+            st.caption("No documents ingested yet.")
+    else:
+        st.caption("Neo4j not connected.")
 
-else:
-    # Landing state — show instructions
-    st.markdown("""
-    <div class="info-card">
-        <h4>👋 Welcome to RAG Claim Attribution</h4>
-        <p>
-            This system implements <strong>Post-Retrieval claim attribution</strong>
-            with a visual <strong>highlight gradient</strong> to show how well each
-            part of the generated response is supported by the source documents.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("---")
 
-    col1, col2 = st.columns(2)
+    st.markdown("#### Configurazione Modello LLM")
+    selected_model = st.selectbox(
+        "Modello di riscrittura",
+        options=["qwen2.5:1.5b", "llama3.2", "llama3"],
+        index=0,
+    )
+    
+    if selected_model == "qwen2.5:1.5b":
+        st.info("⚡ **Tempo stimato**: ~1s per chunk (Molto Veloce)")
+    elif selected_model == "llama3.2":
+        st.info("🚀 **Tempo stimato**: ~3s per chunk (Veloce)")
+    else:
+        st.warning("🐢 **Tempo stimato**: ~10s per chunk (Lento, sconsigliato)")
 
-    with col1:
+    gen = get_generator(selected_model)
+    if gen.is_available():
+        st.markdown('<span class="badge-online">● Ollama Online</span>', unsafe_allow_html=True)
+        st.caption(f"Model in uso: **{gen.model}**")
+        if st.button("🔄 Reload LLM Cache"):
+            get_generator.clear()
+            st.rerun()
+    else:
+        st.markdown('<span class="badge-offline">● Ollama Offline</span>', unsafe_allow_html=True)
+        st.caption(f"Il modello {selected_model} non è stato trovato. Assicurati di averne completato il download.")
+
+    st.markdown("---")
+    st.markdown("#### Settings")
+    semantic_threshold = st.slider(
+        "Semantic similarity threshold",
+        0.5, 1.0, settings.SEMANTIC_THRESHOLD, 0.05,
+    )
+    st.markdown("---")
+    st.caption("Claim Attribution v1.0 — LPG/Neo4j")
+
+
+# ====================================================================
+# Tabs
+# ====================================================================
+
+tab_ingest, tab_claim = st.tabs(["📂 Ingest Documents", "🔍 Claim Attribution"])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 1 — INGEST
+# ──────────────────────────────────────────────────────────────────────
+
+with tab_ingest:
+    st.markdown("### Upload Documents")
+    st.markdown(
+        "<p style='color:#94a3b8;font-size:.9rem;'>"
+        "Supports PDF and TXT. Each file is chunked → coreference resolved (optional, spaCy+coreferee) "
+        "→ triple extracted (REBEL) → indexed in Neo4j."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    uploaded = st.file_uploader(
+        "Choose files",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+    )
+
+    st.caption(
+        "🧹 Coreference resolution: **always on** — required for high-quality "
+        "triple extraction (pronouns/aliases resolved before mREBEL)."
+    )
+
+    run_clustering = st.checkbox(
+        "🔗 Run Entity Clustering after indexing",
+        value=False,
+        help="Merges semantically-equivalent entity nodes (cosine ≥ 0.90). Slower on large graphs."
+    )
+
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        process_btn = st.button(
+            "⚙️ Process & Index",
+            type="primary",
+            use_container_width=True,
+            disabled=(not uploaded or neo4j is None),
+        )
+    with col_btn2:
+        clear_btn = st.button(
+            "🗑️ Clear Graph",
+            use_container_width=True,
+            disabled=(neo4j is None),
+        )
+
+    if clear_btn and neo4j:
+        neo4j.clear_graph()
+        st.cache_resource.clear()
+        st.success("Graph cleared.")
+        st.rerun()
+
+    if process_btn and uploaded and neo4j:
+        import time
+        from src.ingestion.document_loader import DocumentLoader
+        from src.ingestion.coref_resolver import CoreferenceResolver
+        from src.ingestion.triple_extractor import TripleExtractor
+        from src.ingestion.graph_writer import GraphWriter
+
+        loader = DocumentLoader()
+        resolver = CoreferenceResolver()
+        extractor = TripleExtractor()
+        writer = GraphWriter(client=neo4j)
+
+        total_triples = 0
+        total_chunks = 0
+        timings = {"load": 0, "coref": 0, "extract": 0, "embed": 0, "index": 0}
+
+        for ufile in uploaded:
+            tmp_path = Path(f"D:/hf_home/tmp_{ufile.name}")
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_bytes(ufile.read())
+
+            st.markdown(f"#### Processing: `{ufile.name}`")
+
+            # ── Load ──
+            with st.status(f"📄 Loading `{ufile.name}`...", expanded=True) as stage:
+                t0 = time.time()
+                chunks = loader.load(tmp_path)
+                total_chunks += len(chunks)
+                timings["load"] += time.time() - t0
+                stage.update(label=f"📄 Loaded {len(chunks)} chunks ({timings['load']:.1f}s)", state="complete")
+
+            # ── Minibatch streaming: groups of REBEL_BATCH_SIZE chunks ──
+            #    Each batch: coref each chunk → batched mREBEL forward →
+            #    restore original chunk_text → embed + write to Neo4j.
+            #    Crash mid-file = batches already written persist; document
+            #    marked "error" on finalize.
+            file_triples = 0
+            file_status = "done"
+            batch_size = settings.REBEL_BATCH_SIZE
+            n_batches = (len(chunks) + batch_size - 1) // batch_size
+
+            with st.status(
+                f"🌀 Streaming {len(chunks)} chunks in {n_batches} minibatches "
+                f"of {batch_size} → Neo4j...",
+                expanded=True,
+            ) as stage:
+                t_stream = time.time()
+
+                for bi in range(n_batches):
+                    batch = chunks[bi * batch_size:(bi + 1) * batch_size]
+                    originals = [c["text"] for c in batch]
+
+                    # 1. Coref each chunk in batch (mandatory)
+                    t0 = time.time()
+                    resolved_batch = []
+                    for chunk, orig in zip(batch, originals):
+                        resolved_batch.append({**chunk, "text": resolver.resolve(orig)})
+                    timings["coref"] += time.time() - t0
+
+                    # 2. Batched mREBEL forward — internal batching uses
+                    #    REBEL_BATCH_SIZE so 1 forward pass per minibatch.
+                    t0 = time.time()
+                    try:
+                        triples = extractor.extract(resolved_batch)
+                    except Exception as e:
+                        stage.update(label=f"⚠️ Batch {bi+1}/{n_batches}: extract failed ({e})")
+                        file_status = "error"
+                        continue
+                    timings["extract"] += time.time() - t0
+
+                    # 3. Restore ORIGINAL chunk_text per triple (lookup by
+                    #    chunk_index) — evidence must be source verbatim.
+                    orig_by_idx = {c["chunk_index"]: c["text"] for c in batch}
+                    triples = [
+                        t._replace(chunk_text=orig_by_idx.get(t.chunk_index, t.chunk_text))
+                        for t in triples
+                    ]
+
+                    # 4. Embed + write batch
+                    t0 = time.time()
+                    try:
+                        written = writer.write_triples(triples)
+                    except Exception as e:
+                        stage.update(label=f"⚠️ Batch {bi+1}/{n_batches}: write failed ({e})")
+                        file_status = "error"
+                        continue
+                    elapsed = time.time() - t0
+                    timings["embed"] += elapsed * 0.7
+                    timings["index"] += elapsed * 0.3
+
+                    file_triples += written
+                    total_triples += written
+
+                    chunks_done = min((bi + 1) * batch_size, len(chunks))
+                    stage.update(
+                        label=(
+                            f"🌀 Batch {bi+1}/{n_batches} ({chunks_done}/"
+                            f"{len(chunks)} chunks) → +{written} triples "
+                            f"(file total: {file_triples}, "
+                            f"{time.time() - t_stream:.1f}s)"
+                        )
+                    )
+
+                # 5. Finalize Document node ONCE per file
+                writer.finalize_document(
+                    source_file=ufile.name,
+                    num_chunks=len(chunks),
+                    num_triples=file_triples,
+                    status=file_status,
+                )
+                stage.update(
+                    label=(
+                        f"✅ {ufile.name}: {file_triples} triples across "
+                        f"{len(chunks)} chunks in {n_batches} batches "
+                        f"({time.time() - t_stream:.1f}s)"
+                    ),
+                    state="complete",
+                )
+
+            tmp_path.unlink(missing_ok=True)
+
+        # Entity clustering (optional)
+        if run_clustering:
+            from src.ingestion.entity_clusterer import EntityClusterer
+            with st.status("🔗 Clustering entities...", expanded=False) as stage:
+                clusterer = EntityClusterer(client=neo4j)
+                merges = clusterer.cluster()
+                stage.update(
+                    label=f"🔗 Entity clustering complete — {merges} merge(s) performed",
+                    state="complete"
+                )
+
+        # Show timing breakdown
+        st.markdown("### Performance Breakdown")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Load", f"{timings['load']:.1f}s")
+        with col2:
+            st.metric("Coref", f"{timings['coref']:.1f}s")
+        with col3:
+            st.metric("Extract", f"{timings['extract']:.1f}s")
+        with col4:
+            st.metric("Embed", f"{timings['embed']:.1f}s")
+        with col5:
+            st.metric("Index", f"{timings['index']:.1f}s")
+
+        st.success(
+            f"Done! {len(uploaded)} file(s) → {total_chunks} chunks → "
+            f"**{total_triples} triples** indexed in Neo4j."
+        )
+        st.cache_resource.clear()
+        st.rerun()
+
+    if not uploaded:
         st.markdown("""
-        <div class="info-card">
-            <h4>🚀 Getting Started</h4>
+        <div class="card">
+            <h4>Pipeline</h4>
             <p>
-                1. Make sure <strong>Ollama</strong> is running with Llama-3<br>
-                2. Click <strong>"Build Dataset Index"</strong> in the sidebar<br>
-                3. Type your question in the search bar above<br>
-                4. Explore the attributed response with color coding
+                1. <strong>Load</strong> — PDF/TXT → word chunks (200 words, 50 overlap)<br>
+                2. <strong>Clean</strong> — spaCy+coreferee resolves coreferences &amp; normalizes entities<br>
+                3. <strong>Extract</strong> — REBEL extracts (Subject, Predicate, Object) triples<br>
+                4. <strong>Index</strong> — Triples written to Neo4j with predicate embeddings
             </p>
         </div>
         """, unsafe_allow_html=True)
 
-    with col2:
-        st.markdown("""
-        <div class="info-card">
-            <h4>🎨 Color Legend</h4>
-            <p>
-                🟢 <strong>Green</strong> — High support (≥80%)<br>
-                🟡 <strong>Yellow</strong> — Partial support (50-80%)<br>
-                🟠 <strong>Orange</strong> — Weak support (30-50%)<br>
-                🔴 <strong>Red</strong> — Hallucination risk (&lt;30%)
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 2 — CLAIM ATTRIBUTION
+# ──────────────────────────────────────────────────────────────────────
+
+with tab_claim:
+    st.markdown("### Verifica Claim o Domanda")
+    st.markdown(
+        "<p style='color:#94a3b8;font-size:.9rem;'>"
+        "Inserisci un'affermazione (claim) <em>oppure</em> una domanda. "
+        "Le affermazioni vengono parsate via mREBEL e verificate sul grafo. "
+        "Le domande vengono convertite in tripla parziale via LLM e risolte "
+        "tramite pattern query + cosine similarity sul predicato."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    claim_input = st.text_area(
+        "Claim o domanda",
+        placeholder="es. 'Tenma è il protagonista di Monster' oppure 'Chi è il protagonista di Monster?'",
+        height=80,
+    )
+
+    verify_btn = st.button(
+        "🔍 Verifica / Rispondi",
+        type="primary",
+        disabled=(not claim_input.strip() or neo4j is None),
+    )
+
+    if neo4j is None:
+        st.warning("Neo4j not connected. Start Neo4j Desktop first.")
+
+    if verify_btn and claim_input.strip() and neo4j:
+        from src.attribution.claim_attributor import ClaimAttributor
+
+        attributor = ClaimAttributor(
+            client=neo4j,
+            semantic_threshold=semantic_threshold,
+        )
+
+        with st.spinner("Parsing input e query sul grafo..."):
+            result = attributor.attribute(claim_input.strip())
+
+        mode_label = "❓ Domanda" if result.is_question else "📝 Claim"
+        st.caption(f"Modalità rilevata: **{mode_label}**")
+
+        # ── Show parsed/resolved triple ───────────────────────────
+        triple_header = "Risposta (tripla risolta dal grafo)" if result.is_question else "Parsed Triple"
+        st.markdown(f"#### {triple_header}")
+        if result.match_type == "parse_error":
+            msg = result.source_chunk or "Impossibile parsare l'input."
+            st.error(msg)
+        elif result.match_type == "not_found" and not result.subject and not result.obj:
+            st.warning("Nessuna tripla corrispondente trovata nel grafo.")
+        else:
+            answer_class = {
+                "subject": ("triple-tag-answer", "triple-tag", "triple-tag"),
+                "predicate": ("triple-tag", "triple-tag-answer", "triple-tag"),
+                "object": ("triple-tag", "triple-tag", "triple-tag-answer"),
+            }
+            cs, cp, co = answer_class.get(
+                result.answer_field if result.is_question else "",
+                ("triple-tag", "triple-tag", "triple-tag"),
+            )
+            st.markdown(
+                f'<span class="{cs}">S: {result.subject}</span> '
+                f'<span class="{cp}">P: {result.predicate}</span> '
+                f'<span class="{co}">O: {result.obj}</span>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Show attribution result ───────────────────────────────
+        st.markdown("#### Verification Result")
+
+        if result.match_type == "exact":
+            st.markdown(
+                f"""<div class="result-exact">
+                    <strong>✅ EXACT MATCH</strong><br>
+                    Triple found verbatim in the knowledge graph.
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        elif result.match_type == "semantic":
+            st.markdown(
+                f"""<div class="result-semantic">
+                    <strong>🟡 SEMANTIC MATCH</strong> — similarity: {result.similarity:.3f}<br>
+                    Predicate matched via cosine similarity (threshold: {semantic_threshold}).
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        elif result.match_type == "not_found":
+            sim_str = f" (best similarity: {result.similarity:.3f})" if result.similarity > 0 else ""
+            st.markdown(
+                f"""<div class="result-notfound">
+                    <strong>❌ NOT FOUND</strong>{sim_str}<br>
+                    No matching triple in graph — claim cannot be attributed.
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        elif result.match_type == "parse_error":
+            pass  # already shown above
+
+        # ── Source evidence ───────────────────────────────────────
+        if result.source_chunk and result.match_type != "parse_error":
+            st.markdown("#### Source Evidence")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(
+                    f'<div class="chunk-box">{result.source_chunk}</div>',
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.markdown(
+                    f"""<div class="card">
+                        <h4>Metadata</h4>
+                        <p>
+                            <strong>File:</strong> {result.source_file}<br>
+                            <strong>Chunk:</strong> #{result.chunk_index}
+                        </p>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )

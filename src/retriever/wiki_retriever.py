@@ -191,40 +191,62 @@ class WikiRetriever:
 
     def query(self, query_text: str, top_k: Optional[int] = None) -> list[dict]:
         """
-        Recupera i top-K chunk più rilevanti per la query.
-
-        Args:
-            query_text: La domanda dell'utente.
-            top_k:      Numero di risultati da restituire.
-
-        Returns:
-            Lista di dict con chiavi:
-              - "document": testo del chunk
-              - "metadata": metadati (source, chunk_index)
-              - "distance": distanza coseno dal query embedding
+        Recupera i top-K chunk miscelando Dense Similarity e exact Lexical Hits (Hybrid RAG).
         """
         k = top_k or self.top_k
+        # Retrieve a broader pool to re-rank lexically
+        pool_size = k * 10 
         query_embedding = self.embedding_model.encode([query_text]).tolist()
 
         try:
             results = self.collection.query(
                 query_embeddings=query_embedding,
-                n_results=k,
+                n_results=pool_size,
                 include=["documents", "metadatas", "distances"],
             )
         except chromadb.errors.NotEnoughElementsException:
-            # Handle empty collection safely
-            return []
+            # Fallback if collection is too small
+            try:
+                results = self.collection.query(
+                    query_embeddings=query_embedding,
+                    n_results=k,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except chromadb.errors.NotEnoughElementsException:
+                return []
 
         retrieved = []
         if results and results.get("documents") and len(results["documents"]) > 0 and results["documents"][0]:
+            
+            # Estrarre le parole chiave univoche della query ignorando stopwords (lunghezza <= 3)
+            query_words = set(w.lower() for w in query_text.split() if len(w) > 3)
+
             for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
+                # Normalized Dense Score roughly between 0 and 1
+                dense_score = max(0.0, 1.0 - dist)
+                
+                # Unique Keyword Coverage Score
+                doc_words = set(w.lower() for w in doc.split())
+                unique_hits = len(query_words.intersection(doc_words))
+                
+                # Hybrid fusion: Add a 0.5 boost for each unique query word found.
+                # This guarantees that a chunk containing "anime", "studio", AND "sunrise"
+                # will absolutely crush a chunk containing only "anime" and "studio".
+                hybrid_score = dense_score + (unique_hits * 0.5)
+                
                 retrieved.append(
-                    {"document": doc, "metadata": meta, "distance": dist}
+                    {
+                        "document": doc, 
+                        "metadata": meta, 
+                        "distance": dist,
+                        "hybrid_score": hybrid_score
+                    }
                 )
 
-        return retrieved
+        # Re-rank based on Hybrid Score
+        retrieved.sort(key=lambda x: x["hybrid_score"], reverse=True)
+        return retrieved[:k]

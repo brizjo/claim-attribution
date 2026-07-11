@@ -1,3 +1,2 @@
-from .matrix import SupportMatrix
-from .semantic_similarity import SemanticSimilarity
+from .matrix import SupportMatrix, AttributionResult
 from .lexical_overlap import LexicalOverlap

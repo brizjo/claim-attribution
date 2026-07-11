@@ -1,14 +1,14 @@
 """
-Modulo Support Matrix — Core della Claim Attribution.
+Modulo Support Matrix — Audit Matematico Deterministico.
 
-Questo modulo costruisce la matrice di supporto output-contesti:
-  - Righe (Asse Y): fatti atomici estratti dalla risposta LLM
-  - Colonne (Asse X): singole frasi dei documenti di contesto
-  - Celle: score di supporto composito (BERTScore + Lexical Overlap)
+Implementa il framework di valutazione FActScore-like usando esclusivamente
+metriche lessicali deterministiche:
+  - Exact Match (contenenza testuale)
+  - ROUGE-L (Longest Common Subsequence)
 
-La matrice è il cuore del sistema di attribuzione: ogni cella indica
-quanto un dato fatto atomico è supportato da una specifica frase
-del contesto recuperato.
+NON usa modelli generativi NLI per evitare Attestation Bias.
+Ogni claim atomica viene valutata contro i chunk di contesto recuperati
+durante la specifica iterazione CERCA che l'ha generata.
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +17,6 @@ from typing import Optional
 import numpy as np
 
 from config import settings
-from src.attribution.semantic_similarity import SemanticSimilarity
 from src.attribution.lexical_overlap import LexicalOverlap
 
 
@@ -31,41 +30,39 @@ class AttributionResult:
         support_score:      Score di supporto aggregato (0-1).
         best_evidence:      La frase del contesto con il match migliore.
         best_evidence_source: Fonte della frase con il match migliore.
-        bertscore:          Score BERTScore del miglior match.
-        lexical_score:      Score lessicale del miglior match.
+        source_chunk_text:  Il testo esatto del chunk sorgente recuperato.
+        source_id:          Identificatore univoco della fonte.
+        rouge_l:            Score ROUGE-L del miglior match.
+        exact_match:        Score Exact Match del miglior match.
     """
     fact: str
     support_score: float
     best_evidence: str = ""
     best_evidence_source: str = ""
-    bertscore: float = 0.0
-    lexical_score: float = 0.0
+    source_chunk_text: str = ""
+    source_id: str = ""
+    rouge_l: float = 0.0
+    exact_match: float = 0.0
 
 
 class SupportMatrix:
     """
-    Calcola e gestisce la matrice di supporto fatti_atomici × frasi_contesto.
+    Calcola la matrice di supporto usando solo metriche lessicali.
 
-    Il punteggio di ogni cella è un composito pesato:
-        score = w_bert * BERTScore_F1 + w_lex * ROUGE_L
+    Lo score di ogni cella è il massimo tra Exact Match e ROUGE-L:
+        score = max(exact_match, rouge_l)
 
-    I pesi sono configurabili in settings.py.
+    Questo approccio è completamente deterministico e non soffre
+    di Attestation Bias (a differenza di modelli NLI generativi).
     """
 
-    def __init__(
-        self,
-        weight_bertscore: float = settings.WEIGHT_BERTSCORE,
-        weight_lexical: float = settings.WEIGHT_LEXICAL_OVERLAP,
-    ):
-        self.weight_bertscore = weight_bertscore
-        self.weight_lexical = weight_lexical
-        self.semantic = SemanticSimilarity()
+    def __init__(self):
         self.lexical = LexicalOverlap()
 
         # Dati della matrice (popolati dopo compute())
         self.matrix: Optional[np.ndarray] = None
-        self.bert_matrix: Optional[np.ndarray] = None
-        self.lex_matrix: Optional[np.ndarray] = None
+        self.rouge_matrix: Optional[np.ndarray] = None
+        self.em_matrix: Optional[np.ndarray] = None
         self.atomic_facts: list[str] = []
         self.evidence_sentences: list[dict] = []
 
@@ -79,7 +76,7 @@ class SupportMatrix:
         evidence_sentences: list[dict[str, str]],
     ) -> np.ndarray:
         """
-        Calcola la matrice di supporto composita.
+        Calcola la matrice di supporto lessicale M×N.
 
         Args:
             atomic_facts:       Lista di M fatti atomici (dalla risposta LLM).
@@ -95,19 +92,24 @@ class SupportMatrix:
 
         if not atomic_facts or not sentences:
             self.matrix = np.zeros((len(atomic_facts), len(sentences)))
-            self.bert_matrix = self.matrix.copy()
-            self.lex_matrix = self.matrix.copy()
+            self.rouge_matrix = self.matrix.copy()
+            self.em_matrix = self.matrix.copy()
             return self.matrix
 
-        # Calcola le due matrici componenti
-        self.bert_matrix = self.semantic.score_matrix(atomic_facts, sentences)
-        self.lex_matrix = self.lexical.score_matrix(atomic_facts, sentences)
+        m = len(atomic_facts)
+        n = len(sentences)
 
-        # Matrice composita pesata
-        self.matrix = (
-            self.weight_bertscore * self.bert_matrix
-            + self.weight_lexical * self.lex_matrix
-        )
+        # Calcola ROUGE-L matrix
+        self.rouge_matrix = self.lexical.score_matrix(atomic_facts, sentences)
+
+        # Calcola Exact Match matrix
+        self.em_matrix = np.zeros((m, n))
+        for i, fact in enumerate(atomic_facts):
+            for j, ref in enumerate(sentences):
+                self.em_matrix[i, j] = self.lexical.exact_match(fact, ref)
+
+        # Matrice composita: max(exact_match, rouge_l) per ogni cella
+        self.matrix = np.maximum(self.rouge_matrix, self.em_matrix)
 
         return self.matrix
 
@@ -148,8 +150,10 @@ class SupportMatrix:
                     support_score=best_score,
                     best_evidence=best_evidence["sentence"],
                     best_evidence_source=best_evidence.get("source", "Unknown"),
-                    bertscore=float(self.bert_matrix[i, best_j]),
-                    lexical_score=float(self.lex_matrix[i, best_j]),
+                    source_chunk_text=best_evidence.get("chunk_text", best_evidence["sentence"]),
+                    source_id=best_evidence.get("source", "Unknown"),
+                    rouge_l=float(self.rouge_matrix[i, best_j]),
+                    exact_match=float(self.em_matrix[i, best_j]),
                 )
             )
 
@@ -187,8 +191,8 @@ class SupportMatrix:
                     "support_score": r.support_score,
                     "best_evidence": r.best_evidence,
                     "best_evidence_source": r.best_evidence_source,
-                    "bertscore": r.bertscore,
-                    "lexical_score": r.lexical_score,
+                    "rouge_l": r.rouge_l,
+                    "exact_match": r.exact_match,
                 }
                 for r in self.get_attribution_results()
             ],

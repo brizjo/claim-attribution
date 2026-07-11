@@ -1,1 +1,1 @@
-from .wiki_retriever import WikiRetriever
+from .vector_retriever import VectorRetriever

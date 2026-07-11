@@ -1,13 +1,18 @@
 """
-Modulo Highlight Renderer — Visualizzazione gradient per Streamlit.
+Modulo Highlight Renderer — Visualizzazione Highlight Gradient per Streamlit.
 
-Questo modulo genera HTML/CSS per colorare il testo generato con un
-gradient basato sullo score di supporto dalla matrice di attribuzione:
+Genera HTML/CSS per colorare il testo generato con un gradient basato
+sullo score di supporto lessicale (ROUGE-L + Exact Match):
 
   🟢  Verde intenso  →  score ≥ 0.8  (alto supporto)
   🟡  Giallo         →  score 0.5–0.8  (supporto parziale)
   🟠  Arancione      →  score 0.3–0.5  (supporto debole)
   🔴  Rosso          →  score < 0.3  (potenziale allucinazione)
+
+Ogni frase ha un tooltip mouse-over che mostra:
+  - Score di supporto, ROUGE-L e Exact Match
+  - Il testo esatto del chunk sorgente usato per generare la claim
+  - L'identificativo della fonte (anime title)
 
 Il rendering è pensato per st.markdown() con unsafe_allow_html=True.
 """
@@ -20,11 +25,11 @@ from src.attribution.matrix import AttributionResult
 
 class HighlightRenderer:
     """
-    Genera HTML con highlight gradient per visualizzare l'attribuzione
-    nel frontend Streamlit.
+    Genera HTML con highlight gradient e tooltip per visualizzare
+    l'attribuzione nel frontend Streamlit.
     """
 
-    # ── Palette colori (HSLA per controllo fine della sfumatura) ────
+    # ── Palette colori (RGBA per controllo fine della sfumatura) ────
     COLORS = {
         "high":    {"bg": "rgba(16, 185, 129, {alpha})", "border": "#10b981"},   # Emerald
         "medium":  {"bg": "rgba(245, 158, 11, {alpha})", "border": "#f59e0b"},   # Amber
@@ -75,83 +80,148 @@ class HighlightRenderer:
 
     @staticmethod
     def get_global_css() -> str:
-        """Restituisce il CSS globale per lo stile degli highlight."""
+        """Restituisce il CSS globale per lo stile degli highlight e tooltips."""
         return """
         <style>
             .rag-attribution-container {
                 font-family: 'Inter', 'Segoe UI', sans-serif;
-                line-height: 1.8;
-                padding: 1.2rem;
+                line-height: 1.85;
+                padding: 1.5rem;
                 background: rgba(15, 23, 42, 0.6);
-                border-radius: 12px;
+                border-radius: 14px;
                 border: 1px solid rgba(148, 163, 184, 0.1);
-                backdrop-filter: blur(8px);
+                backdrop-filter: blur(12px);
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
             }
             .rag-fact {
                 display: inline;
-                padding: 2px 6px;
-                border-radius: 4px;
+                padding: 3px 7px;
+                border-radius: 5px;
                 margin: 1px 0;
-                transition: all 0.3s ease;
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
                 cursor: pointer;
                 position: relative;
                 border-bottom: 2px solid transparent;
             }
             .rag-fact:hover {
-                filter: brightness(1.2);
+                filter: brightness(1.25);
                 transform: translateY(-1px);
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
             }
+
+            /* ── Tooltip (mouse-over) ─────────────────────────── */
             .rag-tooltip {
                 visibility: hidden;
                 opacity: 0;
                 position: absolute;
-                bottom: 125%;
+                bottom: calc(100% + 12px);
                 left: 50%;
-                transform: translateX(-50%);
-                background: #1e293b;
+                transform: translateX(-50%) translateY(4px);
+                background: linear-gradient(135deg, #1e293b, #0f172a);
                 color: #e2e8f0;
-                padding: 10px 14px;
-                border-radius: 8px;
-                font-size: 0.78rem;
-                line-height: 1.5;
-                min-width: 280px;
-                max-width: 400px;
-                z-index: 1000;
-                box-shadow: 0 10px 25px rgba(0,0,0,0.3);
-                border: 1px solid rgba(148, 163, 184, 0.2);
-                transition: all 0.2s ease;
+                padding: 14px 18px;
+                border-radius: 10px;
+                font-size: 0.8rem;
+                line-height: 1.55;
+                min-width: 320px;
+                max-width: 440px;
+                z-index: 10000;
+                box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4),
+                            0 0 0 1px rgba(148, 163, 184, 0.15);
+                transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
                 pointer-events: none;
             }
             .rag-fact:hover .rag-tooltip {
                 visibility: visible;
                 opacity: 1;
+                transform: translateX(-50%) translateY(0);
             }
             .rag-tooltip::after {
                 content: '';
                 position: absolute;
                 top: 100%;
                 left: 50%;
-                margin-left: -6px;
-                border-width: 6px;
+                margin-left: -7px;
+                border-width: 7px;
                 border-style: solid;
-                border-color: #1e293b transparent transparent transparent;
+                border-color: #0f172a transparent transparent transparent;
             }
+
+            /* ── Tooltip inner elements ───────────────────────── */
+            .tooltip-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+            }
+            .tooltip-score-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                padding: 2px 10px;
+                border-radius: 12px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+            .tooltip-metrics {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 4px 16px;
+                font-size: 0.78rem;
+                margin-bottom: 8px;
+            }
+            .tooltip-metric-label {
+                color: #94a3b8;
+                font-size: 0.72rem;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .tooltip-metric-value {
+                font-weight: 600;
+            }
+            .tooltip-evidence {
+                background: rgba(30, 41, 59, 0.8);
+                border-left: 3px solid;
+                padding: 8px 10px;
+                border-radius: 0 6px 6px 0;
+                font-size: 0.76rem;
+                line-height: 1.5;
+                color: #cbd5e1;
+                font-style: italic;
+                margin-top: 8px;
+            }
+            .tooltip-source-tag {
+                display: inline-block;
+                margin-top: 6px;
+                padding: 2px 8px;
+                border-radius: 8px;
+                background: rgba(99, 102, 241, 0.15);
+                color: #818cf8;
+                font-size: 0.7rem;
+                font-weight: 500;
+            }
+
+            /* ── Score bar ────────────────────────────────────── */
             .rag-score-bar {
                 height: 4px;
-                border-radius: 2px;
-                margin-top: 6px;
-                background: rgba(148, 163, 184, 0.2);
+                border-radius: 3px;
+                margin-top: 8px;
+                background: rgba(148, 163, 184, 0.15);
                 overflow: hidden;
             }
             .rag-score-fill {
                 height: 100%;
-                border-radius: 2px;
+                border-radius: 3px;
                 transition: width 0.5s ease;
             }
+
+            /* ── Legend ───────────────────────────────────────── */
             .rag-legend {
                 display: flex;
                 gap: 16px;
-                padding: 12px 0 4px;
+                padding: 14px 0 4px;
                 font-size: 0.8rem;
                 color: #94a3b8;
                 flex-wrap: wrap;
@@ -166,6 +236,8 @@ class HighlightRenderer:
                 height: 12px;
                 border-radius: 3px;
             }
+
+            /* ── Overall score ────────────────────────────────── */
             .rag-overall-score {
                 text-align: right;
                 font-size: 0.85rem;
@@ -176,58 +248,120 @@ class HighlightRenderer:
         """
 
     # ────────────────────────────────────────────────────────────────
-    # Rendering di un singolo fatto
+    # Rendering di un singolo fatto con tooltip
     # ────────────────────────────────────────────────────────────────
 
     def render_fact(self, result: AttributionResult) -> str:
         """
         Genera l'HTML per un singolo fatto atomico con highlight e tooltip.
 
+        Il tooltip mostra:
+          - Support Score con badge colorato
+          - ROUGE-L score
+          - Exact Match score
+          - Il testo esatto del chunk sorgente recuperato
+          - Il nome della fonte (anime title)
+
         Args:
             result: AttributionResult con score e evidenza.
 
         Returns:
-            Stringa HTML per il fatto colorato.
+            Stringa HTML per il fatto colorato con tooltip.
         """
         bg_color = self._score_to_rgba(result.support_score)
         border_color = self._score_to_border(result.support_score)
         score_pct = f"{result.support_score * 100:.0f}"
+        level = self._get_color_level(result.support_score)
 
-        # Tooltip con dettagli dell'attribuzione
-        tooltip_content = (
-            f"<strong>Support Score:</strong> {score_pct}%<br>"
-            f"<strong>BERTScore F1:</strong> {result.bertscore:.3f}<br>"
-            f"<strong>Lexical (ROUGE-L):</strong> {result.lexical_score:.3f}<br>"
+        # Badge color per il tooltip header
+        badge_bg = {
+            "high": "rgba(16, 185, 129, 0.2)",
+            "medium": "rgba(245, 158, 11, 0.2)",
+            "low": "rgba(249, 115, 22, 0.2)",
+            "none": "rgba(239, 68, 68, 0.2)",
+        }[level]
+
+        level_label = {
+            "high": "✅ High Support",
+            "medium": "⚠️ Partial",
+            "low": "🔶 Weak",
+            "none": "🔴 Hallucination Risk",
+        }[level]
+
+        # ── Costruzione del tooltip ───────────────────────────────
+        tooltip = (
+            # Header con badge
+            f"<div class='tooltip-header'>"
+            f"<span class='tooltip-score-badge' style='background:{badge_bg}; color:{border_color};'>"
+            f"{level_label}</span>"
+            f"<span style='font-weight:700; color:{border_color};'>{score_pct}%</span>"
+            f"</div>"
+            # Metriche
+            f"<div class='tooltip-metrics'>"
+            f"<div><span class='tooltip-metric-label'>ROUGE-L</span><br>"
+            f"<span class='tooltip-metric-value'>{result.rouge_l:.3f}</span></div>"
+            f"<div><span class='tooltip-metric-label'>Exact Match</span><br>"
+            f"<span class='tooltip-metric-value'>{result.exact_match:.3f}</span></div>"
+            f"</div>"
         )
-        if result.best_evidence:
-            # Escape HTML nel testo dell'evidenza
+
+        # Evidenza sorgente (Full Source Chunk)
+        if result.source_chunk_text:
             evidence_escaped = (
-                result.best_evidence
+                result.source_chunk_text
                 .replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")
+                .replace("'", "&#39;")
+                .replace('"', "&quot;")
             )
-            tooltip_content += (
-                f"<hr style='border-color: rgba(148,163,184,0.2); margin: 6px 0;'>"
-                f"<strong>Best Evidence:</strong><br>"
-                f"<em>'{evidence_escaped[:150]}...'</em><br>"
-                f"<span style='color:#64748b'>— {result.best_evidence_source}</span>"
+            # Tronca a 400 caratteri in caso sia troppo lungo
+            evidence_display = evidence_escaped[:400]
+            if len(evidence_escaped) > 400:
+                evidence_display += "..."
+
+            if result.best_evidence_source:
+                source_escaped = (
+                    result.best_evidence_source
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                    .replace("'", "&#39;")
+                )
+                tooltip += (
+                    f"<div style='margin-top:8px; margin-bottom:4px; font-weight:bold; font-size:0.8rem; color:{border_color};'>"
+                    f"📄 Database Chunk: {source_escaped}"
+                    f"</div>"
+                )
+
+            tooltip += (
+                f"<div class='tooltip-evidence' style='border-left-color:{border_color}; font-size:0.8rem;'>"
+                f"{evidence_display}"
+                f"</div>"
             )
 
-        # Score bar nel tooltip
-        tooltip_content += (
+        # Score bar
+        tooltip += (
             f"<div class='rag-score-bar'>"
             f"<div class='rag-score-fill' style='width:{score_pct}%; "
-            f"background:{border_color};'></div>"
+            f"background: linear-gradient(90deg, {border_color}, {border_color}88);'></div>"
             f"</div>"
+        )
+
+        # Escape the fact text too
+        fact_escaped = (
+            result.fact
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
         )
 
         return (
             f"<span class='rag-fact' style='"
             f"background:{bg_color}; "
             f"border-bottom-color:{border_color};'>"
-            f"{result.fact} "
-            f"<span class='rag-tooltip'>{tooltip_content}</span>"
+            f"{fact_escaped} "
+            f"<span class='rag-tooltip'>{tooltip}</span>"
             f"</span>"
         )
 
@@ -250,8 +384,9 @@ class HighlightRenderer:
         Returns:
             Stringa HTML completa da inserire in st.markdown().
         """
-        # CSS globale
-        html = self.get_global_css()
+        # CSS is now injected globally in app.py — no need to include it here.
+        # This prevents Streamlit from stripping duplicate <style> blocks.
+        html = ""
 
         # Container principale
         html += "<div class='rag-attribution-container'>"
@@ -349,9 +484,8 @@ class HighlightRenderer:
         <thead><tr><th>Fact \\ Evidence</th>
         """
 
-        # Header: etichette delle evidenze (troncate)
+        # Header: etichette delle evidenze
         for j, ev_label in enumerate(evidence_labels):
-            truncated = ev_label[:40] + "..." if len(ev_label) > 40 else ev_label
             html += f"<th title='{ev_label}'>E{j+1}</th>"
 
         html += "</tr></thead><tbody>"
