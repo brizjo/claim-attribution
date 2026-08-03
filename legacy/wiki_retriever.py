@@ -15,7 +15,7 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 
-from config import settings
+from legacy import legacy_settings as settings
 
 try:
     from datasets import load_dataset

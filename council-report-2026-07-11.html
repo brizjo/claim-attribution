@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Council — Audit Claim Attribution (2026-07-11)</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1d21; --muted: #5c6470; --border: #e3e6ea;
+    --card: #f7f8fa; --accent: #2f5fd0; --crit: #b3261e; --med: #9a6700; --ok: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171a; --fg:#e6e9ec; --muted:#9aa3ad; --border:#2c3238;
+            --card:#1c2126; --accent:#7aa2f7; --crit:#f28b82; --med:#e3b341; --ok:#7ee2a8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.15rem; margin: 32px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .sub { color: var(--muted); margin-bottom: 24px; }
+  .question { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+              padding: 16px 18px; font-size: .95rem; }
+  .verdict { border-left: 4px solid var(--accent); padding: 4px 0 4px 16px; margin: 12px 0; }
+  .badge { display:inline-block; font-size:.72rem; font-weight:700; letter-spacing:.04em;
+           padding:2px 8px; border-radius:999px; border:1px solid var(--border); vertical-align: middle; }
+  .b-crit { color: var(--crit); border-color: var(--crit); }
+  .b-med  { color: var(--med);  border-color: var(--med); }
+  .b-ok   { color: var(--ok);   border-color: var(--ok); }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .tablewrap { overflow-x: auto; }
+  details { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+            padding: 10px 16px; margin: 10px 0; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p, details li { font-size: .92rem; }
+  code { background: var(--card); border: 1px solid var(--border); border-radius: 4px;
+         padding: 1px 5px; font-size: .85em; }
+  footer { margin-top: 40px; color: var(--muted); font-size: .82rem;
+           border-top: 1px solid var(--border); padding-top: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 14px 0; }
+  .cell { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--card); }
+  .cell b { display: block; margin-bottom: 4px; font-size: .9rem; }
+  .cell span { font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>🏛️ LLM Council — Audit tesi «Claim Attribution su grafo»</h1>
+<div class="sub">5 advisor indipendenti · peer review anonima incrociata · sintesi del Chairman — 11 luglio 2026</div>
+
+<div class="question">
+<b>Domanda al consiglio.</b> La codebase (Neo4j LPG, REBEL, fallback coseno sul predicato) regge davvero i tre pilastri della tesi?
+<b>(A)</b> provenienza sull'arco · <b>(B)</b> matching relazionale corretto (equivalenti sì, inverse no) · <b>(C)</b> simmetria estrazione ingestion/verifica.
+Quali difetti possono invalidare il contributo, ordinati per severità?
+</div>
+
+<h2>Verdetto del Chairman</h2>
+<div class="verdict">
+<p><b>Il pilastro B non è implementato: è contraddetto dal codice.</b> Il fallback semantico è
+<i>solo</i> coseno ≥ 0.75 sul predicato (<code>claim_attributor.py:150-167</code>, <code>settings.py:51</code>) —
+nessuna nozione di relazione inversa, simmetrica o transitiva nell'intero repo. Caso killer, confermato
+da 4 advisor su 5 e da tutti i revisori: arco <code>(Anna, genitore_di, Marco)</code>, claim
+<code>(Anna, figlio_di, Marco)</code> — stessa direzione, coseno ≈ 0.85 → <code>verified=True</code>
+con il chunk del fatto <i>opposto</i> come prova.</p>
+<p><b>Secondo buco critico:</b> nel percorso domande, <code>pred_emb is None</code> →
+<code>verified=True, similarity=1.0</code> su una riga scelta in modo non deterministico
+(<code>claim_attributor.py:216-219</code>, <code>LIMIT</code> senza <code>ORDER BY</code> in
+<code>neo4j_client.py:386-389</code>). Co-menzione spacciata per verifica al 100%.</p>
+<p><b>Lacuna emersa solo in peer review (unanime):</b> non esiste alcun harness di valutazione del
+metodo su grafo — nessun gold set, nessuna precision/recall. I tre pilastri oggi sono non falsificabili.</p>
+<p><b>Raccomandazione:</b> tabella esplicita di proprietà dei predicati (alias / inversa / simmetrica)
+con guardia nel fallback; chiusura del buco a confidenza 1.0; gold set di ~30 coppie
+(parafrasi / inverse / assenti) con metriche. Percorso domande: fuori dal contributo formale.</p>
+<p><b>La prima cosa da fare:</b> scrivere il gold set da 30 coppie e misurare il tasso di falsi positivi
+del sistema <i>attuale</i> — dimostra il bug oggi e dimostrerà il fix domani; quei numeri servono comunque alla tesi.</p>
+</div>
+
+<h2>Posizioni degli advisor</h2>
+<div class="grid">
+  <div class="cell"><b>Contrarian</b><span class="badge b-crit">B affondato</span><br><span>Più votato in peer review (4/5). Coseno-solo = falso positivo strutturale; buco 1.0 non deterministico.</span></div>
+  <div class="cell"><b>First Principles</b><span class="badge b-crit">co-menzione</span><br><span>«Test di co-menzione travestito da verifica». Unico a vedere l'asimmetria coref/cluster sul percorso claim.</span></div>
+  <div class="cell"><b>Outsider</b><span class="badge b-crit">drift doc/codice</span><br><span>Descrizione del metodo ≠ codice (coref ×3 versioni, mREBEL vs rebel-large). Provenienza verbatim vive in app.py.</span></div>
+  <div class="cell"><b>Executor</b><span class="badge b-ok">piano 5 step</span><br><span>Fix minimi ordinati: tabella predicati → guardia inversa → retry simmetrico. Domande: fuori scope.</span></div>
+  <div class="cell"><b>Expansionist</b><span class="badge b-med">smentito</span><br><span>«La direzionalità difende dalle inverse» — respinto all'unanimità (non copre il caso stessa-direzione). Salvati: corroborazione multi-arco, baseline dormienti, ablation simmetria.</span></div>
+</div>
+
+<h2>Dove il consiglio converge</h2>
+<ul>
+  <li><span class="badge b-crit">CRITICO</span> Pilastro B assente: fallback = puro coseno, zero gestione inverse/simmetriche (grep: 0 hit).</li>
+  <li><span class="badge b-crit">CRITICO</span> <code>pred_emb is None</code> → verified a confidenza 1.0 fabbricata, evidenza non riproducibile.</li>
+  <li><span class="badge b-crit">CRITICO</span> Nessun harness di valutazione: pilastri non falsificabili (catch unanime della peer review).</li>
+  <li><span class="badge b-med">MEDIO</span> Merge entità distrugge archi dup↔canonico e la loro provenienza (<code>neo4j_client.py:238,256,270</code>).</li>
+  <li><span class="badge b-med">MEDIO</span> Docstring «both directions» falsa vs Cypher direzionale (<code>neo4j_client.py:316-327</code>).</li>
+  <li><span class="badge b-med">MEDIO</span> Drift documentazione/codice: coref e modello estrattore.</li>
+</ul>
+
+<h2>Dove il consiglio si divide</h2>
+<div class="tablewrap"><table>
+<tr><th>Tema</th><th>Posizione 1</th><th>Posizione 2</th><th>Chairman</th></tr>
+<tr><td>Direzionalità Cypher</td><td>Expansionist: è la difesa anti-inversa, farne un capitolo</td><td>Tutti gli altri: copre solo il caso argomenti-scambiati; l'antonimo stessa-direzione passa</td><td>Con la maggioranza; l'ablation direzionale resta un buon esperimento <i>dopo</i> la guardia</td></tr>
+<tr><td>Pilastro C sui claim</td><td>Executor: simmetrico (stesso estrattore/embedder)</td><td>First Principles: pipeline asimmetrica (coref+cluster in ingest, match letterale in verifica)</td><td>Vere entrambe a livelli diversi: modello sì, normalizzazione no → fix F6</td></tr>
+<tr><td>Percorso domande</td><td>Contrarian/Outsider: violazione critica da fixare</td><td>Executor: scoping fuori tesi, non fixare</td><td>Scoping fuori dal contributo; ma il buco 1.0 va chiuso comunque</td></tr>
+</table></div>
+
+<h2>Punti ciechi colti dalla peer review</h2>
+<ul>
+  <li>Nessun gold set / metriche: la commissione chiederà i numeri per primi (5/5 revisori).</li>
+  <li><code>not_found</code> confonde «claim falso» con «fatto assente dal grafo».</li>
+  <li>Nessuno misura quanto spesso il fallback coseno scatti davvero rispetto all'exact match.</li>
+  <li>Recall di REBEL sui claim brevi non tracciato: falsi negativi strutturali invisibili.</li>
+</ul>
+
+<details><summary>Risposta integrale — The Contrarian</summary>
+<p>Due pilastri su tre falliscono strutturalmente. <b>CRITICO:</b> il fallback è puro coseno a 0.75 (claim_attributor.py:151-166; neo4j_client.py:342-355; settings.py:51); MiniLM mette etichette antonime («parent of»/«child of») a ~0.85+: arco (A, parent_of, B), claim (A, child_of, B) → verified=True. <b>CRITICO:</b> claim_attributor.py:216-219 restituisce la prima riga arbitraria a similarity=1.0; query_partial usa LIMIT senza ORDER BY (neo4j_client.py:386-389) → evidenza non deterministica. <b>CRITICO:</b> le domande non passano da REBEL (Ollama, predicati italiani, question_parser.py:47-63) vs etichette REBEL inglesi. <b>MEDIO:</b> merge entità distrugge archi dup↔canon (neo4j_client.py:238,256,269-272); clustering 0.90 può fondere entità distinte. Solo triples[0] verificata (:131); docstring «both directions» falsa; doc dice Llama-3, codice fastcoref. <b>COSMETICO:</b> password hardcoded; archi duplicati da overlap.</p>
+</details>
+
+<details><summary>Risposta integrale — The First Principles Thinker</summary>
+<p>Il sistema non verifica claim: verifica che due stringhe-entità co-occorrano su un arco col predicato «vicino» — co-menzione travestita. <b>CRITICO:</b> pilastro B solo asserito: il codice è esattamente coseno-solo; la direzione protegge solo se l'inversa è salvata in orientamento inverso; «(Anna, parent of, Marco)» vs arco «(Anna, child of, Marco)» passa. Docstring «both directions» (neo4j_client.py:316) vs query direzionale (:325-327). <b>CRITICO:</b> senza predicato, qualunque arco S–O → verified=True a 1.0 (claim_attributor.py:216-219). <b>CRITICO:</b> ingestion fa coref+clustering (app.py:305, 371-375), la verifica passa il claim grezzo (claim_attributor.py:110) e matcha normalized_name letterale — alias → falsi negativi: stesso estrattore ≠ stessa pipeline. <b>MEDIO:</b> merge distrugge provenienza; triples[0] arbitraria; CREATE duplica. <b>COSMETICO:</b> mREBEL dichiarato, rebel-large configurato.</p>
+</details>
+
+<details><summary>Risposta integrale — The Expansionist</summary>
+<p>Tre asset sottovalutati: (1) la Cypher direzionale blocca le inverse ad argomenti scambiati — farne un'ablation e un argomento strutturale <i>(respinto in peer review per il caso stessa-direzione)</i>; (2) CREATE produce N archi paralleli per lo stesso fatto = corroborazione multi-fonte gratis, oggi buttata da exact_match LIMIT 1 (:299); (3) matrix.py (auditor lessicale) + stack Chroma legacy (settings.py:67-69) = confronto a tre grafo/vettoriale/lessicale quasi gratis. Inoltre la simmetria del pilastro C è architetturale (stesso TripleExtractor, claim_attributor.py:64; stesso embedder, graph_writer.py:21): un'ablation con estrattore diverso la trasforma in risultato empirico. query_partial è un secondo contributo latente (KGQA parziale con provenienza).</p>
+</details>
+
+<details><summary>Risposta integrale — The Outsider</summary>
+<p><b>CRITICO:</b> (1) fallback = coseno 0.75 e basta; unico hit di grep su inverse/direction è una docstring falsa; un esaminatore che prova una coppia inversa affonda il pilastro. (2) Le domande usano Ollama, non REBEL (claim_attributor.py:174-196); senza predicato → verified=True a 1.0 (:216-219). (3) La descrizione del metodo non corrisponde al codice: settings dice Llama-3 (24-28), la UI dice spaCy+coreferee (app.py:205,408), il codice usa fastcoref (coref_resolver.py:25); estrattore inglese rebel-large (settings.py:42) con UI e domande italiane. <b>MEDIO:</b> la provenienza verbatim esiste solo grazie ad app.py:319-325 (GraphWriter da solo salva testo post-coref); merge entità cancella archi; solo triples[0]; CREATE duplica. <b>COSMETICO:</b> password hardcoded; soglie non giustificate; codice legacy morto.</p>
+</details>
+
+<details><summary>Risposta integrale — The Executor</summary>
+<p>A regge (quasi), C regge per i claim, B non esiste. Piano minimo: (1) settings.py: PREDICATE_PROPERTIES {canonico: {aliases, inverse, symmetric}} ~30 righe dal vocabolario REBEL reale del corpus; (2) guardia in _attribute_claim (:150-167): rifiuta coppie inverse, accetta stesso alias-set (~15 righe); (3) retry con S/O scambiati e predicato inverso per relazioni simmetriche/inverse (~10 righe); (4) merge senza `<> canon`, dedup; (5) CREATE→MERGE. Giorni 1–3 = step 1–3. Prima di toccare qualsiasi cosa: 10 coppie inverse/simmetriche scritte a mano come test. Percorso domande: fuori scope, non fixare.</p>
+</details>
+
+<details><summary>Highlights della peer review (5 revisori)</summary>
+<ul>
+<li><b>Più forte: Contrarian (4/5 voti)</b> — citazioni tutte verificate; unico a cogliere LIMIT-senza-ORDER-BY e il mismatch vocabolario IT/EN. Un revisore ha preferito First Principles per l'asimmetria coref/cluster sul percorso claim (verificata: zero riferimenti a cluster/alias in claim_attributor.py).</li>
+<li><b>Punto cieco maggiore: Expansionist (5/5)</b> — la direzionalità non blocca l'antonimo a stessa direzione; riformulare il bug come «capitolo» avrebbe mandato l'autore in difesa col pilastro B ancora aperto.</li>
+<li><b>Mancanza comune a tutti (5/5):</b> nessun harness di valutazione; i test esistenti riguardano solo lo stack RAG legacy. Extra: not_found ambiguo (falso vs assente); tasso di attivazione del fallback mai misurato; recall di REBEL sui claim brevi non tracciato.</li>
+</ul>
+</details>
+
+<h2>Fix ordinati (in attesa di autorizzazione — nessuno applicato)</h2>
+<div class="tablewrap"><table>
+<tr><th>#</th><th>Sev.</th><th>Fix</th><th>Rif.</th></tr>
+<tr><td>F1</td><td><span class="badge b-crit">CRIT</span></td><td>Tabella proprietà predicati (alias/inversa/simmetrica) + guardia nel fallback + retry S/O per simmetriche/inverse</td><td>AUDIT §3.2</td></tr>
+<tr><td>F2</td><td><span class="badge b-crit">CRIT</span></td><td>Chiudere buco pred_emb=None→1.0 + ORDER BY deterministico</td><td>§3.3</td></tr>
+<tr><td>F3</td><td><span class="badge b-crit">CRIT</span></td><td>Harness di valutazione: gold set 30 coppie + precision/recall + tasso fallback</td><td>§5.2</td></tr>
+<tr><td>F4</td><td><span class="badge b-crit">CRIT</span></td><td>Percorso domande: scoping fuori contributo (o unificazione estrattore)</td><td>§4.3</td></tr>
+<tr><td>F5</td><td><span class="badge b-med">MED</span></td><td>Merge entità senza perdita archi (dedup, log)</td><td>§2.2</td></tr>
+<tr><td>F6</td><td><span class="badge b-med">MED</span></td><td>Risoluzione alias/cluster lato claim</td><td>§4.2</td></tr>
+<tr><td>F7</td><td><span class="badge b-med">MED</span></td><td>Verificare tutte le triple del claim, non solo la prima</td><td>§3.4</td></tr>
+<tr><td>F8</td><td><span class="badge b-med">MED</span></td><td>Politica duplicati: MERGE con provenienze o corroborazione documentata senza LIMIT 1</td><td>§2.3</td></tr>
+<tr><td>F9</td><td><span class="badge b-med">MED</span></td><td>Provenienza verbatim garantita nella pipeline, non in app.py</td><td>§2.1</td></tr>
+<tr><td>F10</td><td><span class="badge b-med">MED</span></td><td>Tracking falsi negativi di estrazione</td><td>§1.2</td></tr>
+<tr><td>F11–F14</td><td><span class="badge b-ok">COSM</span></td><td>Docstring, allineamento doc/codice, password in env, giustificazione soglie</td><td>§3.2, §1, —</td></tr>
+</table></div>
+
+<footer>
+Council su: audit Fase 1 tesi «Claim Attribution basata su grafo (Neo4j LPG)» ·
+Generato 2026-07-11 · Report completo: <code>AUDIT.md</code> · Trascrizione: <code>council-transcript-2026-07-11.md</code>
+</footer>
+
+</div>
+</body>
+</html>

@@ -14,7 +14,7 @@ from typing import Optional
 import requests
 from typing import Optional, Callable
 
-from config import settings
+from legacy import legacy_settings as settings
 
 
 class LlamaGenerator:
@@ -98,8 +98,8 @@ class LlamaGenerator:
     def generate_with_stop(
         self,
         prompt: str,
-        stop_tag: str = settings.CERCA_TAG,
-        end_tag: str = settings.CERCA_END,
+        stop_tag: str = "<CERCA:",   # legacy in-generation loop (vedi legacy/)
+        end_tag: str = ">",
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """

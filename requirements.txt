@@ -8,9 +8,13 @@ streamlit>=1.30.0
 # --- Neo4j driver ---
 neo4j>=5.0.0
 
-# --- LLM (Ollama / coreference) ---
+# --- HTTP (DeepSeek API) + coreference ---
+# Ollama non è più usato: legacy/llama_generator.py lo tiene per i moduli legacy.
 requests>=2.31.0
 fastcoref>=2.1.6
+
+# --- Secrets da .env (opzionale: settings.py ha un parser di fallback) ---
+python-dotenv>=1.0.0
 
 # --- Triple extraction (mREBEL) ---
 transformers>=4.35.0
@@ -19,9 +23,6 @@ sentencepiece>=0.2.0   # required by mBART tokenizer for mREBEL
 
 # --- Predicate embeddings ---
 sentence-transformers>=2.3.0
-
-# --- PDF parsing ---
-PyMuPDF>=1.23.0
 
 # --- Numerics ---
 numpy>=1.24.0

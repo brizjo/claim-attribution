@@ -54,7 +54,12 @@ class GraphWriter:
                 "predicate": triple.predicate,
                 "obj": triple.obj,
                 "chunk_text": triple.chunk_text,
+                "claim_span": triple.claim_span,
                 "source_file": triple.source_file,
+                # source_id fa parte della chiave dell'arco: senza fallback
+                # triple identiche da passaggi diversi collasserebbero.
+                "source_id": triple.source_id or f"{triple.source_file}#{triple.chunk_index}",
+                "extractor": triple.extractor,
                 "chunk_index": triple.chunk_index,
                 "predicate_embedding": emb.tolist(),
             })

@@ -21,6 +21,7 @@ Thumbs.db
 # Data & Models
 data/*.json
 data/*.csv
+data/processed_ids.txt
 *.bin
 *.pt
 

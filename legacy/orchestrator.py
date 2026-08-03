@@ -17,9 +17,9 @@ Supporta due modalità:
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-from config import settings
-from src.generator.llama_generator import LlamaGenerator
-from src.retriever.vector_retriever import VectorRetriever
+from legacy import legacy_settings as settings
+from legacy.llama_generator import LlamaGenerator
+from legacy.vector_retriever import VectorRetriever
 
 
 @dataclass

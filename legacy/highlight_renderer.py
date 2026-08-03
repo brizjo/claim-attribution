@@ -19,7 +19,7 @@ Il rendering è pensato per st.markdown() con unsafe_allow_html=True.
 
 from typing import Optional
 
-from config import settings
+from legacy import legacy_settings as settings
 from src.attribution.matrix import AttributionResult
 
 

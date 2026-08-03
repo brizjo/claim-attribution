@@ -2,8 +2,9 @@
 Question parser — converts a natural-language question into a partial
 triple QuerySpec (subject, predicate, object), with None for unknown slots.
 
-Uses Ollama (Llama-3 / Qwen) via LlamaGenerator.  Strict JSON output prompt
-with few-shot examples in Italian + English.
+Usa DeepSeek (JSON mode) via DeepSeekClient — unico LLM del progetto dal
+2026-08-03; prima era Ollama/Llama-3, ora in legacy/.  Prompt a output JSON
+stretto con few-shot in italiano + inglese.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from src.generator.llama_generator import LlamaGenerator
+from src.llm.deepseek_client import DeepSeekClient
 
 
 @dataclass
@@ -40,7 +41,7 @@ class QuerySpec:
 _PROMPT = """Estrai una tripla parziale (Soggetto, Predicato, Oggetto) dalla domanda dell'utente.
 Per ogni componente non noto, usa "?".
 
-Restituisci SOLO un oggetto JSON valido con le chiavi "subject", "predicate", "object".
+Rispondi SOLO con un oggetto JSON valido con le chiavi "subject", "predicate", "object".
 Niente testo extra, niente spiegazioni, niente markdown.
 
 Esempi:
@@ -64,15 +65,20 @@ Output:"""
 
 
 class QuestionParser:
-    """Parses natural-language questions to a partial QuerySpec via Ollama."""
+    """Parses natural-language questions to a partial QuerySpec via DeepSeek."""
 
-    def __init__(self, generator: Optional[LlamaGenerator] = None):
-        self._gen = generator or LlamaGenerator()
+    def __init__(self, client: Optional[DeepSeekClient] = None):
+        # temperature 0 dal client: il parsing di una domanda è deterministico.
+        self._client = client or DeepSeekClient()
 
     def parse(self, question: str) -> QuerySpec:
         prompt = _PROMPT.format(question=question.strip().replace('"', "'"))
         try:
-            raw = self._gen.generate(prompt).strip()
+            raw = self._client.chat(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+                max_tokens=200,
+            ).strip()
         except Exception:
             return QuerySpec()
 

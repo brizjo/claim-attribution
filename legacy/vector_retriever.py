@@ -19,7 +19,7 @@ from typing import Optional
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from config import settings
+from legacy import legacy_settings as settings
 
 
 class VectorRetriever:

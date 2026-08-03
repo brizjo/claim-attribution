@@ -24,6 +24,10 @@ class Triple(NamedTuple):
     chunk_text: str
     source_file: str
     chunk_index: int
+    # ── Provenienza ALCE + estrattore (default per retro-compatibilità) ──
+    source_id: str = ""      # doc["id"] ALCE — chiave di provenienza sull'arco
+    extractor: str = ""      # "rebel" | "deepseek"
+    claim_span: str = ""     # frase del chunk ORIGINALE che supporta la tripla
 
 
 # Language tokens occasionally emitted by mBART-based mREBEL — skipped.
@@ -84,6 +88,8 @@ def _parse_rebel_output(text: str) -> list[tuple[str, str, str]]:
 
 class TripleExtractor:
     """Extracts triples using REBEL (BART) or mREBEL (mBART) — auto-detected."""
+
+    name = settings.EXTRACTOR_REBEL
 
     def __init__(
         self,
@@ -182,8 +188,13 @@ class TripleExtractor:
                             predicate=pred,
                             obj=obj,
                             chunk_text=chunk["text"],
-                            source_file=chunk["source_file"],
-                            chunk_index=chunk["chunk_index"],
+                            source_file=chunk.get("source_file", ""),
+                            chunk_index=chunk.get("chunk_index", 0),
+                            source_id=chunk.get("source_id", ""),
+                            extractor=self.name,
+                            # claim_span viene ancorato sul testo ORIGINALE
+                            # dall'ingestor (qui `chunk` è coref-risolto).
+                            claim_span="",
                         ))
 
         return triples

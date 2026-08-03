@@ -16,8 +16,17 @@ class Neo4jClient:
 
     Schema:
         (:Entity {name, normalized_name})
-        -[:RELATES_TO {predicate, chunk_text, source_file, chunk_index,
+        -[:RELATES_TO {predicate, chunk_text, claim_span, source_file,
+                        source_id, extractor, chunk_index,
                         predicate_embedding}]->
+
+    Chiave logica dell'arco: (predicate, source_id, extractor).
+      * `source_id`  = doc["id"] ALCE → la stessa relazione vista in due
+        passaggi diversi resta come due archi distinti (due prove).
+      * `extractor`  = "rebel" | "deepseek" → i grafi dei due estrattori
+        coesistono senza mescolarsi; il filtro va applicato OVUNQUE.
+    Tutte le scritture usano MERGE (mai CREATE): la re-ingestione dello
+    stesso documento non duplica archi.
     """
 
     def __init__(
@@ -56,6 +65,16 @@ class Neo4jClient:
                 "CREATE CONSTRAINT document_unique IF NOT EXISTS "
                 "FOR (d:Document) REQUIRE d.name IS UNIQUE"
             )
+            # Indice sulla chiave di provenienza: rende O(1) il check di
+            # idempotenza per documento.  Richiede Neo4j 5.x — su versioni
+            # più vecchie si degrada a scan, non è un errore fatale.
+            try:
+                s.run(
+                    "CREATE INDEX rel_source_extractor IF NOT EXISTS "
+                    "FOR ()-[r:RELATES_TO]-() ON (r.source_id, r.extractor)"
+                )
+            except Exception:
+                pass
         self._schema_ready = True
 
     def close(self) -> None:
@@ -64,6 +83,41 @@ class Neo4jClient:
     # ────────────────────────────────────────────────────────────────
     # Write
     # ────────────────────────────────────────────────────────────────
+
+    # Chiave dell'arco: (predicate, source_id, extractor). MERGE, mai CREATE.
+    _MERGE_TRIPLE = """
+    MERGE (sub:Entity {normalized_name: $s_norm})
+      ON CREATE SET sub.name = $s_name
+    MERGE (obj:Entity {normalized_name: $o_norm})
+      ON CREATE SET obj.name = $o_name
+    MERGE (sub)-[r:RELATES_TO {
+        predicate: $pred,
+        source_id: $source_id,
+        extractor: $extractor
+    }]->(obj)
+    SET r.chunk_text = $chunk_text,
+        r.claim_span = $claim_span,
+        r.source_file = $source_file,
+        r.chunk_index = $chunk_index,
+        r.predicate_embedding = $pred_emb
+    """
+
+    @staticmethod
+    def _triple_params(t: dict) -> dict:
+        return {
+            "s_norm": t["subject"].lower().strip(),
+            "s_name": t["subject"],
+            "o_norm": t["obj"].lower().strip(),
+            "o_name": t["obj"],
+            "pred": t["predicate"],
+            "chunk_text": t["chunk_text"],
+            "claim_span": t.get("claim_span", ""),
+            "source_file": t.get("source_file", ""),
+            "source_id": str(t.get("source_id", "")),
+            "extractor": t.get("extractor", ""),
+            "chunk_index": t.get("chunk_index", 0),
+            "pred_emb": t["predicate_embedding"],
+        }
 
     def batch_write_triples(
         self,
@@ -79,32 +133,7 @@ class Neo4jClient:
             tx = s.begin_transaction()
             try:
                 for i, t in enumerate(triples):
-                    s_norm = t["subject"].lower().strip()
-                    o_norm = t["obj"].lower().strip()
-                    tx.run(
-                        """
-                        MERGE (sub:Entity {normalized_name: $s_norm})
-                          ON CREATE SET sub.name = $s_name
-                        MERGE (obj:Entity {normalized_name: $o_norm})
-                          ON CREATE SET obj.name = $o_name
-                        CREATE (sub)-[:RELATES_TO {
-                            predicate: $pred,
-                            chunk_text: $chunk_text,
-                            source_file: $source_file,
-                            chunk_index: $chunk_index,
-                            predicate_embedding: $pred_emb
-                        }]->(obj)
-                        """,
-                        s_norm=s_norm,
-                        s_name=t["subject"],
-                        o_norm=o_norm,
-                        o_name=t["obj"],
-                        pred=t["predicate"],
-                        chunk_text=t["chunk_text"],
-                        source_file=t["source_file"],
-                        chunk_index=t["chunk_index"],
-                        pred_emb=t["predicate_embedding"],
-                    )
+                    tx.run(self._MERGE_TRIPLE, **self._triple_params(t))
                     if progress_callback and (i + 1) % 10 == 0:
                         progress_callback(f"Indexed {i + 1}/{len(triples)} triples...")
                 tx.commit()  # explicit — never trust driver auto-commit on exit
@@ -123,35 +152,103 @@ class Neo4jClient:
         source_file: str,
         chunk_index: int,
         predicate_embedding: list[float],
+        source_id: str = "",
+        extractor: str = "",
+        claim_span: str = "",
     ) -> None:
         self._ensure_schema()
-        s_norm = subject.lower().strip()
-        o_norm = obj.lower().strip()
         with self._session() as s:
-            s.run(
+            s.run(self._MERGE_TRIPLE, **self._triple_params({
+                "subject": subject,
+                "predicate": predicate,
+                "obj": obj,
+                "chunk_text": chunk_text,
+                "claim_span": claim_span,
+                "source_file": source_file,
+                "source_id": source_id,
+                "extractor": extractor,
+                "chunk_index": chunk_index,
+                "predicate_embedding": predicate_embedding,
+            }))
+
+    # ────────────────────────────────────────────────────────────────
+    # Idempotenza / provenienza
+    # ────────────────────────────────────────────────────────────────
+
+    def is_source_ingested(self, source_id: str, extractor: str) -> bool:
+        """
+        True se esiste almeno un arco per quel (source_id, extractor).
+
+        ATTENZIONE: un documento processato che non ha prodotto triple non
+        lascia archi e qui risulta 'non ingerito' — per quello serve anche
+        ProcessedRegistry.
+        """
+        with self._session() as s:
+            rec = s.run(
                 """
-                MERGE (sub:Entity {normalized_name: $s_norm})
-                  ON CREATE SET sub.name = $s_name
-                MERGE (obj:Entity {normalized_name: $o_norm})
-                  ON CREATE SET obj.name = $o_name
-                CREATE (sub)-[:RELATES_TO {
-                    predicate: $pred,
-                    chunk_text: $chunk_text,
-                    source_file: $source_file,
-                    chunk_index: $chunk_index,
-                    predicate_embedding: $pred_emb
-                }]->(obj)
+                MATCH ()-[r:RELATES_TO {source_id: $sid, extractor: $ext}]->()
+                RETURN count(r) > 0 AS ingested
                 """,
-                s_norm=s_norm,
-                s_name=subject,
-                o_norm=o_norm,
-                o_name=obj,
-                pred=predicate,
-                chunk_text=chunk_text,
-                source_file=source_file,
-                chunk_index=chunk_index,
-                pred_emb=predicate_embedding,
+                sid=str(source_id),
+                ext=extractor,
+            ).single()
+            return bool(rec and rec["ingested"])
+
+    def ingested_source_ids(self, extractor: Optional[str] = None) -> set[str]:
+        """Tutti i source_id presenti nel grafo (filtrati per estrattore)."""
+        with self._session() as s:
+            result = s.run(
+                """
+                MATCH ()-[r:RELATES_TO]->()
+                WHERE r.source_id IS NOT NULL
+                  AND ($ext IS NULL OR r.extractor = $ext)
+                RETURN DISTINCT r.source_id AS source_id
+                """,
+                ext=extractor,
             )
+            return {r["source_id"] for r in result}
+
+    def triples_by_source(
+        self,
+        source_id: str,
+        extractor: Optional[str] = None,
+    ) -> list[dict]:
+        """Archi di un singolo passaggio — usato dalla vista di confronto UI."""
+        with self._session() as s:
+            result = s.run(
+                """
+                MATCH (sub:Entity)-[r:RELATES_TO {source_id: $sid}]->(obj:Entity)
+                WHERE $ext IS NULL OR r.extractor = $ext
+                RETURN sub.name AS subject,
+                       r.predicate AS predicate,
+                       obj.name AS object,
+                       r.extractor AS extractor,
+                       r.claim_span AS claim_span,
+                       r.chunk_text AS chunk_text,
+                       r.source_file AS source_file,
+                       r.chunk_index AS chunk_index
+                ORDER BY r.extractor, sub.name
+                """,
+                sid=str(source_id),
+                ext=extractor,
+            )
+            return [dict(r) for r in result]
+
+    def delete_by_source(self, source_id: str, extractor: Optional[str] = None) -> int:
+        """Cancella gli archi di un passaggio — per re-ingest pulito."""
+        with self._session() as s:
+            rec = s.run(
+                """
+                MATCH ()-[r:RELATES_TO {source_id: $sid}]->()
+                WHERE $ext IS NULL OR r.extractor = $ext
+                WITH collect(r) AS rels
+                FOREACH (rel IN rels | DELETE rel)
+                RETURN size(rels) AS deleted
+                """,
+                sid=str(source_id),
+                ext=extractor,
+            ).single()
+            return rec["deleted"] if rec else 0
 
     def clear_graph(self) -> None:
         with self._session() as s:
@@ -236,13 +333,16 @@ class Neo4jClient:
                     MATCH (canon:Entity {normalized_name: $canon_norm})
                     MATCH (dup)-[r:RELATES_TO]->(target)
                     WHERE target <> canon
-                    CREATE (canon)-[:RELATES_TO {
+                    MERGE (canon)-[new:RELATES_TO {
                         predicate: r.predicate,
-                        chunk_text: r.chunk_text,
-                        source_file: r.source_file,
-                        chunk_index: r.chunk_index,
-                        predicate_embedding: r.predicate_embedding
+                        source_id: r.source_id,
+                        extractor: r.extractor
                     }]->(target)
+                    SET new.chunk_text = r.chunk_text,
+                        new.claim_span = r.claim_span,
+                        new.source_file = r.source_file,
+                        new.chunk_index = r.chunk_index,
+                        new.predicate_embedding = r.predicate_embedding
                     """,
                     dup_norm=duplicate_normalized,
                     canon_norm=canonical_name.lower().strip(),
@@ -254,13 +354,16 @@ class Neo4jClient:
                     MATCH (canon:Entity {normalized_name: $canon_norm})
                     MATCH (source)-[r:RELATES_TO]->(dup)
                     WHERE source <> canon
-                    CREATE (source)-[:RELATES_TO {
+                    MERGE (source)-[new:RELATES_TO {
                         predicate: r.predicate,
-                        chunk_text: r.chunk_text,
-                        source_file: r.source_file,
-                        chunk_index: r.chunk_index,
-                        predicate_embedding: r.predicate_embedding
+                        source_id: r.source_id,
+                        extractor: r.extractor
                     }]->(canon)
+                    SET new.chunk_text = r.chunk_text,
+                        new.claim_span = r.claim_span,
+                        new.source_file = r.source_file,
+                        new.chunk_index = r.chunk_index,
+                        new.predicate_embedding = r.predicate_embedding
                     """,
                     dup_norm=duplicate_normalized,
                     canon_norm=canonical_name.lower().strip(),
@@ -280,6 +383,7 @@ class Neo4jClient:
         subject: str,
         predicate: str,
         obj: str,
+        extractor: Optional[str] = None,
     ) -> Optional[dict]:
         """Return first relationship where all three match exactly (case-insensitive)."""
         s_norm = subject.lower().strip()
@@ -292,15 +396,20 @@ class Neo4jClient:
                       -[r:RELATES_TO]->
                       (obj:Entity {normalized_name: $o_norm})
                 WHERE toLower(r.predicate) = $p_norm
+                  AND ($ext IS NULL OR r.extractor = $ext)
                 RETURN r.predicate AS predicate,
                        r.chunk_text AS chunk_text,
+                       r.claim_span AS claim_span,
                        r.source_file AS source_file,
+                       r.source_id AS source_id,
+                       r.extractor AS extractor,
                        r.chunk_index AS chunk_index
                 LIMIT 1
                 """,
                 s_norm=s_norm,
                 o_norm=o_norm,
                 p_norm=p_norm,
+                ext=extractor,
             )
             record = result.single()
             return dict(record) if record else None
@@ -311,6 +420,7 @@ class Neo4jClient:
         obj: str,
         query_embedding: list[float],
         top_k: int = 5,
+        extractor: Optional[str] = None,
     ) -> list[dict]:
         """
         Fetch all relationships between subject and object (both directions),
@@ -325,14 +435,19 @@ class Neo4jClient:
                 MATCH (sub:Entity {normalized_name: $s_norm})
                       -[r:RELATES_TO]->
                       (obj:Entity {normalized_name: $o_norm})
+                WHERE $ext IS NULL OR r.extractor = $ext
                 RETURN r.predicate AS predicate,
                        r.chunk_text AS chunk_text,
+                       r.claim_span AS claim_span,
                        r.source_file AS source_file,
+                       r.source_id AS source_id,
+                       r.extractor AS extractor,
                        r.chunk_index AS chunk_index,
                        r.predicate_embedding AS pred_emb
                 """,
                 s_norm=s_norm,
                 o_norm=o_norm,
+                ext=extractor,
             )
             rows = [dict(r) for r in result]
 
@@ -361,6 +476,7 @@ class Neo4jClient:
         predicate_embedding: Optional[list[float]] = None,
         top_k: int = 5,
         pool_size: int = 200,
+        extractor: Optional[str] = None,
     ) -> list[dict]:
         """
         Pattern query for partial triples (any of subject/object may be None).
@@ -376,17 +492,23 @@ class Neo4jClient:
         MATCH (sub:Entity)-[r:RELATES_TO]->(obj:Entity)
         WHERE ($s_norm IS NULL OR sub.normalized_name = $s_norm)
           AND ($o_norm IS NULL OR obj.normalized_name = $o_norm)
+          AND ($ext IS NULL OR r.extractor = $ext)
         RETURN sub.name AS subject,
                obj.name AS object,
                r.predicate AS predicate,
                r.chunk_text AS chunk_text,
+               r.claim_span AS claim_span,
                r.source_file AS source_file,
+               r.source_id AS source_id,
+               r.extractor AS extractor,
                r.chunk_index AS chunk_index,
                r.predicate_embedding AS pred_emb
         LIMIT $pool
         """
         with self._session() as s:
-            result = s.run(cypher, s_norm=s_norm, o_norm=o_norm, pool=pool_size)
+            result = s.run(
+                cypher, s_norm=s_norm, o_norm=o_norm, pool=pool_size, ext=extractor
+            )
             rows = [dict(r) for r in result]
 
         if not rows:
@@ -443,6 +565,20 @@ class Neo4jClient:
             if rec:
                 return {"nodes": rec["nodes"], "relations": rec["relations"]}
             return {"nodes": 0, "relations": 0}
+
+    def stats_by_extractor(self) -> list[dict]:
+        """Archi e passaggi distinti per estrattore — confronto REBEL/DeepSeek."""
+        with self._session() as s:
+            result = s.run(
+                """
+                MATCH ()-[r:RELATES_TO]->()
+                RETURN coalesce(r.extractor, '(none)') AS extractor,
+                       count(r) AS relations,
+                       count(DISTINCT r.source_id) AS sources
+                ORDER BY extractor
+                """
+            )
+            return [dict(r) for r in result]
 
     def is_connected(self) -> bool:
         try:

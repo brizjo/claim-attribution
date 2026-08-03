@@ -42,3 +42,50 @@ Architectural note from user (2026-04-27):
 - [ ] Verify Neo4j nodes/edges created correctly
 - [ ] Verify claim attribution returns correct source chunk
 - [ ] Check semantic fallback triggers when exact match fails
+
+## Phase 10: Refactor legacy → cartella legacy/ (2026-07-18) — COMPLETATA
+- [x] Spostati in `legacy/`: orchestrator.py, vector_retriever.py, wiki_retriever.py, highlight_renderer.py (git mv, storia preservata)
+- [x] Creato `legacy/legacy_settings.py`: CERCA_*, SUPPORT_THRESHOLD_*, CHROMA_*, EMBEDDING_MODEL (bge-m3), prompt anime (CHAIN_OF_CITATION/RESUME/REFINEMENT) — rimossi da config/settings.py
+- [x] Import legacy aggiornati: `from legacy import legacy_settings as settings` (ri-esporta anche settings attivi)
+- [x] src/generator/__init__.py: rimosso InGenerationOrchestrator; llama_generator.py: default stop_tag hardcoded (LlamaGenerator resta attivo — usato da question_parser)
+- [x] Rimossi package vuoti src/retriever/ e src/visualization/
+- [x] Verifica REBEL English-only: rebel-large, SRC_LANG=None, test EN → triple corrette; test IT → triple degradate/errate (conferma: corpus deve essere inglese)
+- [ ] TODO futuro: rimuovere ingestione PDF/TXT, lavorare direttamente su domande ALCE (integrazione successiva)
+
+## Phase 9: Audit critico (LLM Council, 2026-07-11) — FASE 1 COMPLETATA
+- [x] Council 5 advisor + peer review + sintesi → `AUDIT.md`, `council-report-2026-07-11.html`, `council-transcript-2026-07-11.md`
+- [ ] Decisione utente su fix autorizzati (F1–F14 in AUDIT.md, ordinati per severità)
+- Fix critici individuati: F1 tabella proprietà predicati (pilastro B assente — coseno-solo matcha relazioni inverse), F2 buco pred_emb=None→verified 1.0, F3 harness valutazione inesistente, F4 scoping percorso domande
+
+## Phase 11: Corpus ALCE + estrattori multipli (2026-08-03)
+- [x] `src/ingestion/alce_loader.py` — entry ASQA + primi 5 docs, nessun chunking, solo `text` originale
+- [x] `src/ingestion/alce_ingestor.py` — orchestratore skip → coref → estrazione → claim_span → MERGE → registro
+- [x] `src/ingestion/deepseek_extractor.py` — estrattore LLM (API OpenAI-compatible, JSON mode) + prompt
+- [x] `src/ingestion/processed_registry.py` — `data/processed_ids.txt`, gestisce i doc a ZERO triple
+- [x] `src/ingestion/span_matcher.py` — `claim_span` ancorato al testo originale
+- [x] Neo4j: `MERGE` con chiave `(predicate, source_id, extractor)`, indice, `is_source_ingested`, `ingested_source_ids`, `triples_by_source`, `delete_by_source`, `stats_by_extractor`
+- [x] Filtro `extractor` in `exact_match` / `semantic_fallback` / `query_partial` + `ClaimAttributor`
+- [x] `merge_entity_into_canonical` preserva `source_id`/`extractor`/`claim_span`
+- [x] UI: tab "Corpus ALCE" (lista domande ✓/◐/○, ingest, testo originale → coref → triple REBEL vs DeepSeek), selettore grafo nel tab attribution
+- [x] Rimossi ingestione PDF/TXT (`document_loader.py`, PyMuPDF, CHUNK_SIZE_WORDS) — chiude il TODO di Phase 10
+- [x] `.env.example` + caricamento `.env` in `config/settings.py`
+- [x] Verificato headless: loader (948 entry), span matcher, parser DeepSeek, registro, skip/force/zero-triple (stub), `AppTest` senza eccezioni
+
+### Da verificare con Neo4j acceso (non testabile con DB offline)
+- [ ] MERGE idempotente: doppia ingestione della stessa domanda → conteggio archi invariato
+- [ ] Due estrattori sullo stesso passaggio → archi separati, `stats_by_extractor` li distingue
+- [ ] Attribution filtrata per estrattore restituisce solo archi di quel grafo
+- [ ] Entity clustering non mescola i grafi (props preservate)
+
+### Prossimo
+- [ ] Ingestione batch (CLI) su N domande per il confronto REBEL vs DeepSeek
+- [ ] Metrica di copertura per estrattore usando `answers_found` come ground truth
+
+## Phase 12: Ollama → legacy (2026-08-03)
+- [x] `llama_generator.py` e `OLLAMA_*` spostati in `legacy/` (git mv, storia preservata)
+- [x] `src/generator/`, `src/retriever/`, `src/visualization/` rimossi (package vuoti)
+- [x] `src/llm/deepseek_client.py` — trasporto HTTP condiviso (chat + JSON mode + retry)
+- [x] `QuestionParser` portato da Ollama a DeepSeek (altrimenti il percorso "domanda" moriva in silenzio)
+- [x] `DEEPSEEK_TEMPERATURE = 0.0` su tutte le chiamate
+- [x] UI: rimosso selettore modello Ollama e badge; resta il badge DeepSeek
+- [x] Verificato live: ping API, estrazione su passaggio ALCE, question parser IT+EN, AppTest senza eccezioni

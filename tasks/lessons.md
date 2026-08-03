@@ -24,3 +24,94 @@
 - Predicate embeddings stored as float array on relationship — cosine similarity computed in Python (relationship vector indexes require Neo4j 5.18+)
 - Neo4j multi-DB: server may host more than one database. `Neo4jClient` MUST be constructed with `database=...` (default `"neo4j"`, settable via `NEO4J_DATABASE` env). All sessions go through `_session()` so the DB is consistent. UI shows active DB name + list of visible DBs — if Browser shows different counts, pick the matching DB in Browser.
 - `batch_write_triples` uses explicit `tx.commit()`/`tx.rollback()` (not `with begin_transaction()` auto-commit) — driver behavior was version-dependent, explicit is bulletproof.
+
+## Fase 11 — Corpus ALCE + estrattori multipli (2026-08-03)
+
+### Modifiche al database
+- **Chiave logica dell'arco `RELATES_TO`: `(predicate, source_id, extractor)`.**
+  Tutte le scritture usano `MERGE`, mai `CREATE` (`Neo4jClient._MERGE_TRIPLE`):
+  la re-ingestione dello stesso passaggio non duplica archi, ma la stessa
+  relazione vista in due passaggi diversi resta come due archi distinti
+  (due prove indipendenti).
+- Proprietà nuove sull'arco: `source_id` (= `doc["id"]` ALCE, provenienza),
+  `extractor` (`"rebel"` | `"deepseek"`), `claim_span` (frase del chunk
+  ORIGINALE che supporta la tripla).
+- Indice `rel_source_extractor` su `(r.source_id, r.extractor)` per rendere
+  O(1) il check di idempotenza (creazione in try/except: richiede Neo4j 5.x).
+- `merge_entity_into_canonical` copiava le proprietà con `CREATE` elencandole
+  a mano → perdeva `source_id`/`extractor`/`claim_span` e avrebbe **mescolato
+  i grafi dei due estrattori** al primo clustering. Ora usa `MERGE` con la
+  stessa chiave logica. *Lezione: ogni proprietà nuova sull'arco va aggiunta
+  anche nei due blocchi di copia del clustering, altrimenti sparisce in
+  silenzio.*
+
+### Modifiche alla logica di matching
+- `exact_match`, `semantic_fallback`, `query_partial` accettano
+  `extractor: Optional[str]` → `WHERE ($ext IS NULL OR r.extractor = $ext)`.
+  `ClaimAttributor(extractor=...)` lo propaga a tutte e tre.
+  **Solo filtro di provenienza: scoring e routing invariati.** `None` = nessun
+  filtro. I due grafi non vanno mai interrogati insieme: predicati identici da
+  estrattori diversi falserebbero il confronto.
+
+### Idempotenza a due livelli (nessuno dei due basta da solo)
+- Neo4j (`is_source_ingested`) **non vede i documenti a zero triple**: senza
+  archi risulterebbero non processati e verrebbero riestratti a ogni run —
+  ed è l'estrazione la parte costosa, non il MERGE.
+- `ProcessedRegistry` (`data/processed_ids.txt`, TSV
+  `extractor \t source_id \t n_triples \t timestamp`) copre quel caso e
+  fornisce la metrica di copertura (`zero_triple_ids()`), ma non sa se il
+  grafo è stato svuotato.
+- Un doc è saltato se risulta processato in ALMENO uno dei due; `force=True`
+  cancella gli archi (`delete_by_source`) e riestrae.
+- `Clear Graph` NON tocca il registro: dopo uno svuotamento serve `force`.
+
+### claim_span
+- Né REBEL né DeepSeek danno offset affidabili sul testo originale (REBEL non
+  ne dà, DeepSeek vede il testo coref-risolto). `span_matcher.best_span()`
+  ancora la tripla alla frase del testo ORIGINALE con massimo overlap
+  lessicale su subject/object (+ span dell'LLM come cue), split a regex.
+  Deterministico, zero costo, nessun modello caricato.
+- `chunk_text` resta sempre il testo originale ALCE: l'evidenza dev'essere
+  verbatim, mai il testo riscritto dalla coref.
+
+### Corpus
+- `summary` ed `extraction` nei doc ALCE sono generati da un LLM a monte:
+  **ignorati**, si usa sempre `text`.
+- I passaggi sono già chunk (~100 parole, top-5 ri-rankati oracle) → nessun
+  chunking. `document_loader.py` (PDF/TXT) rimosso, insieme a
+  `CHUNK_SIZE_WORDS`/`CHUNK_OVERLAP_WORDS` e alla dipendenza PyMuPDF.
+
+### Streamlit
+- `st.stop()` dentro un tab ferma l'INTERO script, non il tab: il corpo del
+  tab ALCE è una funzione (`_render_ingest_tab`) così i `return` di guardia
+  (corpus mancante, filtro vuoto) non spengono il tab di attribution.
+
+### Segreti
+- `DEEPSEEK_API_KEY` letta da `.env` nella root (già in `.gitignore`) da
+  `config/settings.py`; `python-dotenv` è opzionale — c'è un parser di
+  fallback per non rompere gli ambienti che non l'hanno. Template in
+  `.env.example`. Mai hardcodare la chiave nei sorgenti.
+
+## Fase 12 — Ollama fuori dalla pipeline attiva (2026-08-03)
+
+- `src/generator/llama_generator.py` → `legacy/llama_generator.py`; package
+  `src/generator/` rimosso (era vuoto). `OLLAMA_*` spostati da
+  `config/settings.py` a `legacy/legacy_settings.py`. `legacy/orchestrator.py`
+  importa da `legacy.llama_generator`.
+- **`QuestionParser` dipendeva da Ollama**: spostare il generator senza altro
+  avrebbe ucciso in silenzio il percorso "domanda" dell'attribution (il parser
+  ritorna `QuerySpec()` vuoto su eccezione → sembra solo "domanda non
+  parsabile"). Portato su DeepSeek. *Lezione: prima di archiviare un modulo,
+  cercare chi lo importa — qui il fallimento sarebbe stato silenzioso.*
+- Trasporto HTTP DeepSeek estratto in `src/llm/deepseek_client.py`
+  (`chat(messages, json_mode)`): lo usano sia l'estrattore di triple sia il
+  question parser, invece di duplicare retry/auth. `DeepSeekExtractor` tiene
+  solo prompt + parsing.
+- `temperature=0.0` per TUTTE le chiamate DeepSeek (estrazione e parsing):
+  output deterministico, mai creativo.
+- JSON mode DeepSeek richiede che la parola "JSON" compaia nel prompt —
+  vincolo dell'API, entrambi i prompt la contengono.
+- Ollama non era una dipendenza pip (chiamate via `requests`): da
+  `requirements.txt` non c'era nulla da togliere, solo commenti da correggere.
+- Verificato live con la chiave reale: ping API ok, 10 triple estratte da un
+  passaggio ALCE con `claim_span` verbatim, question parser IT+EN corretto.

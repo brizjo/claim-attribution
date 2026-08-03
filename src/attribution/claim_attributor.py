@@ -8,7 +8,7 @@ Two routes:
        parse with mREBEL → exact match → semantic predicate-cosine fallback
 
   2. Question path (interrogative input)
-       parse with Ollama into partial triple (?, P, O) / (S, ?, O) / (S, P, ?)
+       parse with DeepSeek into partial triple (?, P, O) / (S, ?, O) / (S, P, ?)
        → Neo4j pattern query → rank candidates by predicate cosine similarity
 """
 
@@ -35,6 +35,8 @@ class AttributionResult:
     similarity: float = 0.0
     source_chunk: str = ""
     source_file: str = ""
+    source_id: str = ""                # doc["id"] ALCE — provenienza
+    claim_span: str = ""               # frase esatta che supporta la tripla
     chunk_index: int = 0
     verified: bool = False
     # Question-mode metadata
@@ -57,10 +59,15 @@ class ClaimAttributor:
         client: Neo4jClient,
         semantic_threshold: float = settings.SEMANTIC_THRESHOLD,
         embedding_model: str = settings.PREDICATE_EMBEDDING_MODEL,
+        extractor: Optional[str] = settings.ACTIVE_EXTRACTOR,
     ):
         self._client = client
         self._threshold = semantic_threshold
         self._model_name = embedding_model
+        # Filtro di provenienza: le query toccano SOLO gli archi di questo
+        # estrattore, così i grafi rebel/deepseek non si mescolano.
+        # None = nessun filtro (interroga tutto il grafo).
+        self._extractor = extractor
         self._extractor = TripleExtractor()
         self._qparser: Optional[QuestionParser] = None
         self._encoder = None
@@ -137,19 +144,25 @@ class ClaimAttributor:
         )
 
         # Stage 1: exact match
-        exact = self._client.exact_match(t.subject, t.predicate, t.obj)
+        exact = self._client.exact_match(
+            t.subject, t.predicate, t.obj, extractor=self._extractor
+        )
         if exact:
             result.match_type = "exact"
             result.similarity = 1.0
             result.source_chunk = exact["chunk_text"]
             result.source_file = exact["source_file"]
+            result.source_id = exact.get("source_id", "") or ""
+            result.claim_span = exact.get("claim_span", "") or ""
             result.chunk_index = exact.get("chunk_index", 0)
             result.verified = True
             return result
 
         # Stage 2: semantic fallback (predicate cosine, S/O fixed)
         pred_emb = self._embed(t.predicate)
-        candidates = self._client.semantic_fallback(t.subject, t.obj, pred_emb)
+        candidates = self._client.semantic_fallback(
+            t.subject, t.obj, pred_emb, extractor=self._extractor
+        )
 
         if candidates:
             best = candidates[0]
@@ -159,6 +172,8 @@ class ClaimAttributor:
                 result.similarity = sim
                 result.source_chunk = best["chunk_text"]
                 result.source_file = best["source_file"]
+                result.source_id = best.get("source_id", "") or ""
+                result.claim_span = best.get("claim_span", "") or ""
                 result.chunk_index = best.get("chunk_index", 0)
                 result.verified = True
             else:
@@ -193,6 +208,7 @@ class ClaimAttributor:
             obj=spec.object,
             predicate_embedding=pred_emb,
             top_k=5,
+            extractor=self._extractor,
         )
 
         answer_field = spec.unknown_field() or ""
@@ -236,6 +252,8 @@ class ClaimAttributor:
             similarity=similarity,
             source_chunk=best["chunk_text"],
             source_file=best["source_file"],
+            source_id=best.get("source_id", "") or "",
+            claim_span=best.get("claim_span", "") or "",
             chunk_index=best.get("chunk_index", 0),
             verified=verified,
             answer_field=answer_field,

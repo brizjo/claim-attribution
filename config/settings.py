@@ -2,11 +2,14 @@
 Configurazione centralizzata — Claim Attribution LPG/Neo4j.
 
 Pipeline:
- - Ingestione: PDF/TXT → coreference (Llama-3) → triple REBEL → Neo4j
+ - Ingestione: passaggi ALCE/ASQA → coreference → triple (REBEL | DeepSeek) → Neo4j
  - Attribution: claim → REBEL parse → exact match / semantic fallback cosine
+
+Il corpus è ESCLUSIVAMENTE ALCE: nessun loader PDF/TXT (rimosso 2026-08-03).
 """
 
 import os
+from pathlib import Path
 
 # ── Forza TUTTI i download/cache su D: — DEVE essere prima di qualsiasi import ──
 HF_HOME = r"D:\hf_home"
@@ -21,11 +24,35 @@ os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_HOME, "datasets") # Dataset ca
 os.environ["TORCH_HOME"] = os.path.join(HF_HOME, "torch")           # PyTorch models
 os.environ["XDG_CACHE_HOME"] = HF_HOME                              # Generic fallback
 
-# ── Ollama / Llama-3 (coreference resolution) ────────────────────────
-OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.2"  # Usiamo Llama 3.2 (3B) o "llama3.2:1b" (1B) perché è molto più veloce di Llama 3 8B
-OLLAMA_TEMPERATURE = 0.1
-OLLAMA_MAX_TOKENS = 2048
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ── Secrets: .env nella root del progetto (gitignored) ───────────────
+# Chiavi lette da .env se presente, altrimenti dalle variabili d'ambiente
+# di sistema.  python-dotenv è opzionale: senza il pacchetto si usa un
+# parser minimale, così il progetto non si rompe se non è installato.
+def _load_dotenv() -> None:
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_path, override=False)
+        return
+    except ImportError:
+        pass
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+# Ollama/Llama-3 rimosso dalla pipeline attiva (2026-08-03): l'unico LLM è
+# DeepSeek via API.  OLLAMA_* vive in legacy/legacy_settings.py insieme a
+# legacy/llama_generator.py.
 
 # ── Neo4j ───────────────────────────────────────────────────────────
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -43,84 +70,47 @@ REBEL_MODEL = "Babelscape/rebel-large"
 REBEL_SRC_LANG = None            # only used when model name contains "mrebel"
 REBEL_MAX_LENGTH = 256           # max new tokens generated
 REBEL_BATCH_SIZE = 16            # batched forward; tune to GPU/CPU memory
-CHUNK_SIZE_WORDS = 200           # words per chunk
-CHUNK_OVERLAP_WORDS = 50         # overlap between chunks
+
+# ── Estrattori di triple ─────────────────────────────────────────────
+# Ogni arco in Neo4j porta la proprietà `extractor`: i grafi dei diversi
+# estrattori coesistono senza mescolarsi (filtro in MERGE, idempotenza,
+# e in TUTTE le query di attribution).
+EXTRACTOR_REBEL = "rebel"
+EXTRACTOR_DEEPSEEK = "deepseek"
+AVAILABLE_EXTRACTORS = [EXTRACTOR_REBEL, EXTRACTOR_DEEPSEEK]
+ACTIVE_EXTRACTOR = os.getenv("ACTIVE_EXTRACTOR", EXTRACTOR_REBEL)
+
+# ── DeepSeek (estrattore LLM, API OpenAI-compatible) ─────────────────
+# API key: mettila in `.env` nella root del progetto (già in .gitignore):
+#     DEEPSEEK_API_KEY=sk-...
+# Non hardcodarla qui.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_TEMPERATURE = 0.0       # SEMPRE 0: estrazione deterministica, mai creativa
+DEEPSEEK_MAX_TOKENS = 1500
+DEEPSEEK_TIMEOUT = 120           # secondi per richiesta
+DEEPSEEK_MAX_RETRIES = 3
+
+# ── Corpus ALCE/ASQA (unica sorgente di ingestione) ──────────────────
+ALCE_DATA_PATH = os.getenv(
+    "ALCE_DATA_PATH",
+    r"D:\python_projects\rag\ALCE\data\asqa_eval_gtr_top100_reranked_oracle.json",
+)
+ALCE_DOCS_PER_ENTRY = 5          # top-5 passaggi già ri-rankati oracle
+
+# Registro dei doc_id già processati, per estrattore (TSV).
+# Serve a non riprocessare i documenti che producono ZERO triple:
+# senza archi in Neo4j il check di idempotenza non li vedrebbe.
+PROCESSED_REGISTRY_PATH = str(PROJECT_ROOT / "data" / "processed_ids.txt")
 
 # ── Predicate Embedding (semantic fallback) ───────────────────────────
 PREDICATE_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SEMANTIC_THRESHOLD = 0.75       # cosine similarity threshold for fallback match
 ENTITY_CLUSTER_THRESHOLD = 0.90 # cosine similarity threshold for entity clustering
 
-# ── Segmentazione (legacy, kept for spacy) ───────────────────────────
+# ── spaCy (coreference resolution) ───────────────────────────────────
 SPACY_MODEL = "en_core_web_lg"  # Used by CoreferenceResolver (coreferee requires lg)
 
-# ── Legacy — kept for backward compat with old modules ───────────────
-CERCA_TAG = "<CERCA:"
-CERCA_END = ">"
-MAX_CERCA_ITERATIONS = 3
-SUPPORT_THRESHOLD_HIGH = 0.8
-SUPPORT_THRESHOLD_MEDIUM = 0.5
-SUPPORT_THRESHOLD_LOW = 0.3
-TOP_K_DOCUMENTS = 5
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
-EMBEDDING_MODEL = "BAAI/bge-m3"
-CHROMA_COLLECTION_NAME = "claim_attribution"
-CHROMA_PERSIST_DIR = r"D:\rag_vector_db"
-
-# ── Prompt Templates ─────────────────────────────────────────────────────
-
-# True In-Generation Attribution Prompt
-# We rely heavily on the LLM's spontaneity to halt generation. Since 8B models
-# can be stubborn, we use a very aggressive constraint format and explicit few-shot.
-CHAIN_OF_CITATION_SYSTEM = """You are a highly restrictive factual anime AI. Your core architecture requires you to verify facts before speaking.
-
-CRITICAL DIRECTIVE: You CANNOT answer from your own memory. Whenever you are asked a factual question, you MUST IMMEDIATELY halt and query your database using the EXACT syntax:
-<CERCA: [query]>
-
-Do NOT output anything else after the tag. Just the tag and stop.
-
---- FEW-SHOT EXAMPLES (Adhere to this strictly) ---
-
-User: "Tell me about Attack on Titan."
-Assistant: I need to retrieve the facts for this anime. <CERCA: Attack on Titan plot characters studio>
-
-User: "Tell me about some anime made by Sunrise."
-Assistant: I must first find a general list of anime produced by Sunrise studio. <CERCA: Anime produced by Sunrise studio list>
-
-User: "When was Naruto first released?"
-Assistant: I must verify the release date. <CERCA: Naruto release date>
-
---- END EXAMPLES ---
-
-Now, process the user's question. If it asks for factual anime details, output your thoughts and then the <CERCA: query> tag and STOP."""
-
-# Template per il prompt con contesto iniettato dopo una CERCA
-RESUME_PROMPT_TEMPLATE = """{system_prompt}
-
-### Retrieved Sources (Use ONLY these to answer):
-{sources}
-
-### Instructions for Next Token:
-You were interrupted mid-sentence while searching for facts.
-1. SEAMLESS CONTINUATION: Output the very next word of the text you were generating. Do NOT output phrases like "As I was saying" or "Based on the retrieved sources". Just continue the sentence naturally.
-2. CITATIONS: You MUST cite the sources using [1], [2], etc.
-3. PREVIOUS QUERIES: You have already searched for: {past_queries}. Do NOT repeat these.
-4. MULTI-HOP REASONING: If the sources gave you a general list (like anime by a studio) but you need specific details to answer properly, output a NEW search for the specific items. Example: <CERCA: Cowboy Bebop synopsis>.
-5. NO PLACEHOLDERS: If the sources do not contain the answer, state clearly that the sources do not provide the information. NEVER output generic placeholders like "[Insert specific examples]".
-6. If you have enough info, finish the answer factually.
-"""
-
-# Prompt per il raffinamento finale del testo intermedio
-REFINEMENT_PROMPT = """You are an expert anime encyclopedic editor. Rewrite the following drafted notes into a massive, comprehensive, and highly detailed final answer.
-
-## Rules:
-1. FIX BROKEN SENTENCES: The draft was generated in chunks. Connect the sentences so it flows perfectly.
-2. EXPAND: Do not just output one sentence. Write a rich, detailed, encyclopedic paragraph containing ALL the facts. Do not omit any anime names or details.
-3. CITATIONS: Preserve all numeric citations like [1], [2]. Ensure every single fact is followed by its corresponding citation.
-4. NO META-TALK: Do not say "Here is your rewritten text". Just output the final text.
-
-Draft to Rewrite:
-{intermediate_text}
-
-Final Comprehensive Answer:"""
+# Legacy in-generation/baseline settings (CERCA, ChromaDB, prompt anime)
+# spostati in legacy/legacy_settings.py — vedi legacy/ per i moduli baseline.
