@@ -1,10 +1,15 @@
 """
-Claim Attribution — LPG/Neo4j Streamlit App.
+Claim Attribution -- LPG/Neo4j Streamlit App.
 
-Tab 1 — Ingest ALCE: domanda ASQA → 5 passaggi → coref → triple
-        (REBEL e/o DeepSeek) → Neo4j.  Corpus ESCLUSIVAMENTE ALCE:
-        l'ingestione di PDF/TXT è stata rimossa (2026-08-03).
-Tab 2 — Claim Attribution: input claim → exact match / semantic fallback → source
+Tab 1 -- Corpus ALCE: 6-step pipeline
+    Step 1: Choose ASQA question
+    Step 2: Show passages
+    Step 3: Coreference resolution
+    Step 4: Extract triples (REBEL / DeepSeek)
+    Step 5: Review all triples
+    Step 6: Write to Neo4j
+
+Tab 2 -- Claim Attribution: input claim -> exact match / semantic fallback -> source
 
 Run: streamlit run app.py
 """
@@ -29,7 +34,6 @@ from config import settings
 
 st.set_page_config(
     page_title="Claim Attribution",
-    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -71,6 +75,13 @@ st.markdown("""
     background:rgba(15,23,42,.6); border:1px solid rgba(99,102,241,.2);
     border-radius:8px; padding:1rem; font-size:.9rem; line-height:1.7;
     color:#cbd5e1; font-style:italic; margin-top:.8rem; }
+.step-header {
+    font-size:1.1rem; font-weight:600; color:#a5b4fc;
+    border-bottom:1px solid rgba(99,102,241,.2); padding-bottom:.4rem;
+    margin-top:1.5rem; margin-bottom:.8rem; }
+.span-label {
+    color:#94a3b8; font-size:.82rem; font-style:italic;
+    margin-top:4px; margin-bottom:8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -84,20 +95,20 @@ def get_neo4j_client():
     try:
         from src.graph.neo4j_client import Neo4jClient
         return Neo4jClient()
-    except Exception as e:
+    except Exception:
         return None
 
 
 @st.cache_resource
 def get_alce_loader():
-    """Corpus ALCE caricato una sola volta per sessione (~10MB)."""
+    """ALCE corpus loaded once per session (~10MB)."""
     from src.ingestion.alce_loader import AlceLoader
     return AlceLoader()
 
 
 @st.cache_resource
 def get_ingestor(extractor_name: str):
-    """Un ingestor per estrattore — il modello REBEL resta caricato."""
+    """One ingestor per extractor — keeps REBEL model loaded."""
     from src.ingestion.alce_ingestor import AlceIngestor, build_extractor
     return AlceIngestor(
         client=get_neo4j_client(),
@@ -111,13 +122,26 @@ def get_deepseek():
     return DeepSeekExtractor()
 
 
+@st.cache_resource
+def get_debug_rebel_extractor():
+    """Standalone REBEL — no Neo4j dependency, for debug/timing."""
+    from src.ingestion.triple_extractor import TripleExtractor
+    return TripleExtractor()
+
+
+@st.cache_resource
+def get_debug_coref_resolver():
+    from src.ingestion.coref_resolver import CoreferenceResolver
+    return CoreferenceResolver()
+
+
 # ====================================================================
 # Header
 # ====================================================================
 
 st.markdown("""
 <div class="main-header">
-    <h1>🧠 Claim Attribution — LPG/Neo4j</h1>
+    <h1>Claim Attribution -- LPG/Neo4j</h1>
 </div>
 """, unsafe_allow_html=True)
 
@@ -131,45 +155,45 @@ with st.sidebar:
 
     neo4j = get_neo4j_client()
     if neo4j and neo4j.is_connected():
-        st.markdown('<span class="badge-online">● Neo4j Connected</span>', unsafe_allow_html=True)
+        st.markdown('<span class="badge-online">Neo4j Connected</span>', unsafe_allow_html=True)
         stats = neo4j.stats()
         st.caption(f"Entities: **{stats['nodes']}** | Relations: **{stats['relations']}**")
         active_db = getattr(neo4j, "database", None)
         if active_db:
-            st.caption(f"DB attiva: `{active_db}` — assicurati che Browser punti qui")
+            st.caption(f"Active DB: `{active_db}` -- make sure Browser points here")
         list_dbs = getattr(neo4j, "list_databases", None)
         if callable(list_dbs):
             dbs = list_dbs()
             if dbs:
-                st.caption(f"DB visibili: {', '.join(dbs)}")
-        if st.button("♻️ Reload Neo4j Client"):
+                st.caption(f"Visible DBs: {', '.join(dbs)}")
+        if st.button("Reload Neo4j Client"):
             get_neo4j_client.clear()
             st.rerun()
     else:
-        st.markdown('<span class="badge-offline">● Neo4j Offline</span>', unsafe_allow_html=True)
+        st.markdown('<span class="badge-offline">Neo4j Offline</span>', unsafe_allow_html=True)
         st.warning(
             "Start Neo4j Desktop, open a database, then set:\n"
             "```\nNEO4J_PASSWORD=yourpass\n```\nin your environment."
         )
-        if st.button("🔄 Retry Connection"):
+        if st.button("Retry Connection"):
             get_neo4j_client.clear()
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### Grafo per estrattore")
+    st.markdown("#### Graph by extractor")
     if neo4j and neo4j.is_connected():
         rows = neo4j.stats_by_extractor()
         if rows:
             import pandas as pd
             df = pd.DataFrame(rows)
-            df.columns = ["Extractor", "Archi", "Passaggi"]
+            df.columns = ["Extractor", "Edges", "Passages"]
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
-            st.caption("Nessun arco nel grafo.")
+            st.caption("No edges in the graph.")
     else:
         st.caption("Neo4j not connected.")
 
-    st.markdown("#### Copertura estrattori (registro)")
+    st.markdown("#### Extractor coverage (registry)")
     from src.ingestion.processed_registry import ProcessedRegistry
     _registry = ProcessedRegistry()
     _registry.reload()
@@ -177,22 +201,22 @@ with st.sidebar:
         _s = _registry.stats(_ext)
         if _s["docs"]:
             st.caption(
-                f"`{_ext}` — {_s['docs']} doc, {_s['triples']} triple, "
-                f"**{_s['zero_triple_docs']} a zero triple** "
-                f"(copertura {_s['coverage']:.0%})"
+                f"`{_ext}` -- {_s['docs']} docs, {_s['triples']} triples, "
+                f"**{_s['zero_triple_docs']} with zero triples** "
+                f"(coverage {_s['coverage']:.0%})"
             )
         else:
-            st.caption(f"`{_ext}` — nessun documento processato")
+            st.caption(f"`{_ext}` -- no documents processed")
 
     st.markdown("---")
-    st.markdown("#### DeepSeek (unico LLM: estrazione + parsing domande)")
+    st.markdown("#### DeepSeek (LLM: extraction + question parsing)")
     _ds = get_deepseek()
     if _ds.is_available():
-        st.markdown('<span class="badge-online">● API key configurata</span>', unsafe_allow_html=True)
-        st.caption(f"Model: **{_ds.model}** — temperature {settings.DEEPSEEK_TEMPERATURE}")
+        st.markdown('<span class="badge-online">API key configured</span>', unsafe_allow_html=True)
+        st.caption(f"Model: **{_ds.model}** -- temperature {settings.DEEPSEEK_TEMPERATURE}")
     else:
-        st.markdown('<span class="badge-offline">● API key mancante</span>', unsafe_allow_html=True)
-        st.caption("Crea `.env` nella root con `DEEPSEEK_API_KEY=sk-...`")
+        st.markdown('<span class="badge-offline">API key missing</span>', unsafe_allow_html=True)
+        st.caption("Create `.env` in project root with `DEEPSEEK_API_KEY=sk-...`")
 
     st.markdown("---")
     st.markdown("#### Settings")
@@ -201,22 +225,22 @@ with st.sidebar:
         0.5, 1.0, settings.SEMANTIC_THRESHOLD, 0.05,
     )
     st.markdown("---")
-    st.caption("Claim Attribution v1.0 — LPG/Neo4j")
+    st.caption("Claim Attribution v1.0 -- LPG/Neo4j")
 
 
 # ====================================================================
 # Tabs
 # ====================================================================
 
-tab_ingest, tab_claim = st.tabs(["📚 Corpus ALCE", "🔍 Claim Attribution"])
+tab_ingest, tab_claim = st.tabs(["Corpus ALCE", "Claim Attribution"])
 
 
 # ──────────────────────────────────────────────────────────────────────
-# TAB 1 — INGEST ALCE
+# TAB 1 — CORPUS ALCE (6-step pipeline)
 # ──────────────────────────────────────────────────────────────────────
 
 def _render_triples(rows: list[dict], empty_msg: str) -> None:
-    """Lista ⟨S,P,O⟩ + claim_span. `rows`: dict subject/predicate/object."""
+    """Render a list of (S, P, O) triples with claim_span."""
     if not rows:
         st.caption(empty_msg)
         return
@@ -229,19 +253,23 @@ def _render_triples(rows: list[dict], empty_msg: str) -> None:
         )
         span = (r.get("claim_span") or "").strip()
         if span:
-            st.caption(f"↳ {span}")
+            st.markdown(
+                f'<div class="span-label">source: {span}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def _render_ingest_tab() -> None:
-    """Corpo del tab ALCE — funzione così i `return` non fermano l'app intera."""
+    """Body of the ALCE tab — function so `return` does not stop the whole app."""
+
     st.markdown("### Corpus ALCE / ASQA")
     st.markdown(
         "<p style='color:#94a3b8;font-size:.9rem;'>"
-        "Unica sorgente del sistema. Ogni domanda porta i primi 5 passaggi "
-        "(già ri-rankati oracle, ~100 parole ciascuno = chunk nativi). "
-        "Pipeline: testo originale → coref → estrazione triple "
-        "(<strong>REBEL</strong> e/o <strong>DeepSeek</strong>) → Neo4j, "
-        "con <code>source_id</code> = <code>doc[\"id\"]</code> come provenienza."
+        "Sole data source. Each question has 5 passages "
+        "(oracle-reranked, ~100 words each = native chunks). "
+        "Pipeline: original text -> coref -> triple extraction "
+        "(<strong>REBEL</strong> and/or <strong>DeepSeek</strong>) -> Neo4j, "
+        "with <code>source_id</code> = <code>doc[\"id\"]</code> as provenance."
         "</p>",
         unsafe_allow_html=True,
     )
@@ -250,193 +278,339 @@ def _render_ingest_tab() -> None:
 
     if not loader.exists():
         st.error(
-            f"Corpus non trovato: `{loader.path}`\n\n"
-            "Imposta `ALCE_DATA_PATH` in `config/settings.py` (o come variabile "
-            "d'ambiente) sul file `asqa_eval_gtr_top100_reranked_oracle.json`."
+            f"Corpus not found: `{loader.path}`\n\n"
+            "Set `ALCE_DATA_PATH` in `config/settings.py` (or as an "
+            "environment variable) to the `asqa_eval_gtr_top100_reranked_oracle.json` file."
         )
         return
 
     entries = loader.entries()
 
-    # ── Selezione estrattori ──────────────────────────────────────────
+    # ================================================================
+    # STEP 1 — Choose Question
+    # ================================================================
+    st.markdown('<div class="step-header">Step 1 -- Choose Question</div>', unsafe_allow_html=True)
+
     col_ext, col_search = st.columns([1, 2])
     with col_ext:
-        active_extractors = st.multiselect(
-            "Estrattori",
+        active_extractor = st.radio(
+            "Extractor",
             options=settings.AVAILABLE_EXTRACTORS,
-            default=[settings.EXTRACTOR_REBEL],
-            help="I grafi restano separati: ogni arco porta la proprietà `extractor`.",
+            index=0,
+            horizontal=True,
+            help="Select which extractor to use for triple extraction.",
         )
     with col_search:
         search_q = st.text_input(
-            "Filtra domande",
-            placeholder="es. 'world cup', 'president', 'album'...",
+            "Filter questions",
+            placeholder="e.g. 'world cup', 'president', 'album'...",
         )
 
-    if settings.EXTRACTOR_DEEPSEEK in active_extractors and not get_deepseek().is_available():
+    if active_extractor == settings.EXTRACTOR_DEEPSEEK and not get_deepseek().is_available():
         st.warning(
-            "DeepSeek selezionato ma `DEEPSEEK_API_KEY` non è configurata — "
-            "crea `.env` nella root del progetto (vedi `.env.example`)."
+            "DeepSeek selected but `DEEPSEEK_API_KEY` is not configured -- "
+            "create `.env` in project root (see `.env.example`)."
         )
 
-    # ── Stato di ingestione (Neo4j DISTINCT source_id ∪ registro) ─────
-    status_ext = active_extractors[0] if active_extractors else settings.EXTRACTOR_REBEL
+    # Ingestion status (Neo4j DISTINCT source_id + registry)
     processed_ids: set[str] = set()
     if neo4j is not None:
         try:
-            processed_ids = get_ingestor(status_ext).processed_ids()
+            processed_ids = get_ingestor(active_extractor).processed_ids()
         except Exception as exc:
-            st.warning(f"Stato ingestione non disponibile: {exc}")
+            st.warning(f"Ingestion status unavailable: {exc}")
 
     filtered = loader.search(search_q, limit=200)
 
     def _entry_label(e) -> str:
         ids = {d["source_id"] for d in e.docs()}
         done = ids & processed_ids
-        mark = "✓" if done and len(done) == len(ids) else ("◐" if done else "○")
+        if done and len(done) == len(ids):
+            mark = "[done]"
+        elif done:
+            mark = "[partial]"
+        else:
+            mark = "[new]"
         return f"{mark}  {e.question}"
 
     if not filtered:
-        st.info("Nessuna domanda corrisponde al filtro.")
+        st.info("No questions match the filter.")
         return
 
     st.caption(
-        f"{len(filtered)} domande mostrate su {len(entries)} — "
-        f"✓ tutti i passaggi ingeriti con `{status_ext}`, ◐ parziale, ○ nessuno"
+        f"{len(filtered)} questions shown out of {len(entries)} -- "
+        f"[done] = all passages ingested with `{active_extractor}`, "
+        f"[partial] = some, [new] = none"
     )
 
     selected = st.selectbox(
-        "Domanda",
+        "Question",
         options=filtered,
         format_func=_entry_label,
         index=0,
     )
 
-    # ── Ground truth ASQA ─────────────────────────────────────────────
+    # Ground truth
     st.markdown(f"#### {selected.question}")
     st.caption(f"sample_id: `{selected.sample_id}`")
-    with st.expander(f"Ground truth — {len(selected.qa_pairs)} sotto-risposte", expanded=False):
+    with st.expander(f"Ground truth -- {len(selected.qa_pairs)} sub-answers", expanded=False):
         for i, qa in enumerate(selected.qa_pairs):
             answers = ", ".join(qa.get("short_answers", []))
-            st.markdown(f"**{i}.** {qa.get('question', '')} → *{answers}*")
+            st.markdown(f"**{i}.** {qa.get('question', '')} -> *{answers}*")
 
-    # ── Azioni ────────────────────────────────────────────────────────
-    col_a, col_b, col_c = st.columns([2, 1, 1])
-    with col_a:
-        ingest_btn = st.button(
-            "⚙️ Ingerisci questa domanda",
-            type="primary",
-            use_container_width=True,
-            disabled=(neo4j is None or not active_extractors),
-        )
-    with col_b:
-        force = st.checkbox("Force re-ingest", value=False, help="Cancella gli archi esistenti di questo passaggio e riestrae.")
-    with col_c:
-        clear_btn = st.button("🗑️ Clear Graph", use_container_width=True, disabled=(neo4j is None))
-
-    if clear_btn and neo4j:
-        neo4j.clear_graph()
-        st.cache_resource.clear()
-        st.success("Graph cleared. Il registro `processed_ids.txt` NON è stato toccato: "
-                   "usa 'Force re-ingest' per riprocessare.")
-        st.rerun()
-
-    # ── Ingestione ────────────────────────────────────────────────────
-    if ingest_btn and neo4j:
-        reports = {}
-        for ext_name in active_extractors:
-            with st.status(f"🌀 {ext_name}: ingestione di 5 passaggi...", expanded=True) as stage:
-                try:
-                    ingestor = get_ingestor(ext_name)
-                except Exception as exc:
-                    stage.update(label=f"❌ {ext_name}: {exc}", state="error")
-                    continue
-
-                report = ingestor.ingest_entry(
-                    selected,
-                    skip_existing=not force,
-                    force=force,
-                    progress=lambda msg: stage.update(label=f"🌀 {msg}"),
-                )
-                reports[ext_name] = report
-
-                zero = len(report.zero_triple_docs)
-                skipped = sum(1 for d in report.docs if d.skipped)
-                errors = [d for d in report.docs if d.error]
-                stage.update(
-                    label=(
-                        f"✅ {ext_name}: {report.total_triples} triple "
-                        f"({len(report.processed)} passaggi processati, "
-                        f"{skipped} saltati, {zero} a zero triple, "
-                        f"{len(errors)} errori)"
-                    ),
-                    state="error" if errors else "complete",
-                )
-                for d in errors:
-                    st.error(f"{ext_name} / {d.source_id}: {d.error}")
-
-        # Testo coref-risolto: solo in memoria, non persistito nel grafo.
-        st.session_state["last_reports"] = {
-            ext: {d.source_id: d for d in rep.docs} for ext, rep in reports.items()
-        }
-        st.session_state["last_sample_id"] = selected.sample_id
-
-    # ── Vista corpus + triple ─────────────────────────────────────────
-    st.markdown("### Passaggi e triple estratte")
-
-    last = (
-        st.session_state.get("last_reports", {})
-        if st.session_state.get("last_sample_id") == selected.sample_id
-        else {}
-    )
+    # ================================================================
+    # STEP 2 — Show Passages
+    # ================================================================
+    st.markdown('<div class="step-header">Step 2 -- Show Passages</div>', unsafe_allow_html=True)
 
     for chunk in selected.docs():
         sid = chunk["source_id"]
         found = chunk.get("answers_found") or []
         supports = [str(i) for i, v in enumerate(found) if v]
-        badge = f" — supporta le sotto-risposte {', '.join(supports)}" if supports else ""
+        badge = f" -- supports sub-answers {', '.join(supports)}" if supports else ""
 
         with st.expander(
-            f"[{chunk['chunk_index']}] {chunk['title']}  ·  source_id `{sid}`{badge}",
+            f"[{chunk['chunk_index']}] {chunk['title']}  |  source_id `{sid}`{badge}",
             expanded=False,
         ):
-            st.markdown("**Testo originale (corpus ALCE)**")
+            st.markdown("**Original text (ALCE corpus)**")
             st.markdown(f'<div class="chunk-box">{chunk["text"]}</div>', unsafe_allow_html=True)
 
-            for ext_name in settings.AVAILABLE_EXTRACTORS:
-                doc_result = last.get(ext_name, {}).get(sid)
-                if doc_result and doc_result.resolved_text:
-                    st.markdown(f"**Testo coref-risolto — input di `{ext_name}`**")
-                    st.markdown(
-                        f'<div class="chunk-box">{doc_result.resolved_text}</div>',
-                        unsafe_allow_html=True,
-                    )
-                    break  # il coref non dipende dall'estrattore: uno basta
+    # ================================================================
+    # STEP 3 — Coreference Resolution
+    # ================================================================
+    st.markdown('<div class="step-header">Step 3 -- Coreference Resolution</div>', unsafe_allow_html=True)
 
-            col_r, col_d = st.columns(2)
-            for col, ext_name in zip((col_r, col_d), settings.AVAILABLE_EXTRACTORS):
-                with col:
-                    st.markdown(f"**Triple — `{ext_name}`**")
+    skip_coref = st.checkbox("Skip coreference resolution", value=False,
+                              help="Disable coref if you want raw text passed to the extractor.")
+
+    # ================================================================
+    # STEP 4 — Extract Triples
+    # ================================================================
+    st.markdown('<div class="step-header">Step 4 -- Extract Triples</div>', unsafe_allow_html=True)
+
+    extract_btn = st.button(
+        "Extract Triples",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if extract_btn:
+        import time
+        from src.ingestion.span_matcher import best_span
+        from src.ingestion.output_store import save_coref
+
+        extractor_obj = get_debug_rebel_extractor() if active_extractor == settings.EXTRACTOR_REBEL else get_deepseek()
+        resolver = get_debug_coref_resolver()
+        results = []
+
+        with st.status(f"{active_extractor}: extracting triples...", expanded=True) as stage:
+            for chunk in selected.docs():
+                original = chunk.get("text", "")
+                sid = chunk["source_id"]
+                stage.update(label=f"Processing source_id={sid}...")
+
+                # Coref
+                if not skip_coref:
+                    resolved = resolver.resolve(original)
+                else:
+                    resolved = original
+
+                # Save coref to JSONL
+                save_coref(
+                    source_id=sid,
+                    sample_id=selected.sample_id,
+                    title=chunk.get("title", ""),
+                    chunk_index=chunk.get("chunk_index", 0),
+                    original_text=original,
+                    resolved_text=resolved,
+                )
+
+                # Extract
+                t0 = time.time()
+                raw = extractor_obj.extract([{**chunk, "text": resolved}])
+                elapsed = time.time() - t0
+
+                triples = [
+                    t._replace(chunk_text=original, claim_span=best_span(original, t.subject, t.obj))
+                    for t in raw
+                ]
+
+                results.append({
+                    "source_id": sid,
+                    "chunk_index": chunk.get("chunk_index", 0),
+                    "title": chunk.get("title", ""),
+                    "original_text": original,
+                    "resolved_text": resolved,
+                    "triples": triples,
+                    "elapsed": elapsed,
+                })
+
+            total = sum(len(r["triples"]) for r in results)
+            total_t = sum(r["elapsed"] for r in results)
+            stage.update(
+                label=f"Done: {total} triples total, {total_t:.3f}s ({active_extractor})",
+                state="complete",
+            )
+
+        # Save triples to JSONL
+        from src.ingestion.output_store import save_triples_batch
+        for r in results:
+            if r["triples"]:
+                triples_dicts = [
+                    {
+                        "source_id": r["source_id"],
+                        "subject": t.subject,
+                        "predicate": t.predicate,
+                        "obj": t.obj,
+                        "claim_span": t.claim_span,
+                        "chunk_text": t.chunk_text,
+                        "source_file": t.source_file,
+                        "title": r["title"],
+                        "chunk_index": t.chunk_index,
+                    }
+                    for t in r["triples"]
+                ]
+                save_triples_batch(triples_dicts, selected.sample_id, active_extractor)
+
+        st.session_state["extract_results"] = {
+            "sample_id": selected.sample_id,
+            "extractor": active_extractor,
+            "results": results,
+        }
+
+    # ================================================================
+    # STEP 5 — Review All Triples
+    # ================================================================
+    st.markdown('<div class="step-header">Step 5 -- Review All Triples</div>', unsafe_allow_html=True)
+
+    extract_data = st.session_state.get("extract_results")
+    if extract_data and extract_data["sample_id"] == selected.sample_id:
+        ext_label = extract_data["extractor"]
+        total_triples = sum(len(r["triples"]) for r in extract_data["results"])
+        total_time = sum(r["elapsed"] for r in extract_data["results"])
+        st.caption(
+            f"Extractor: `{ext_label}` | "
+            f"Total triples: {total_triples} | "
+            f"Total time: {total_time:.3f}s"
+        )
+
+        for r in extract_data["results"]:
+            with st.expander(
+                f"[{r['chunk_index']}] {r['title']}  |  source_id `{r['source_id']}`  |  "
+                f"time: {r['elapsed']:.3f}s  |  {len(r['triples'])} triples",
+                expanded=False,
+            ):
+                st.markdown("**Original text (ALCE passage)**")
+                st.markdown(f'<div class="chunk-box">{r["original_text"]}</div>', unsafe_allow_html=True)
+
+                if r["resolved_text"] != r["original_text"]:
+                    st.markdown(f"**Coref-resolved text -- input to `{ext_label}`**")
+                    st.markdown(f'<div class="chunk-box">{r["resolved_text"]}</div>', unsafe_allow_html=True)
+
+                st.markdown("**Extracted triples**")
+                rows = [
+                    {"subject": t.subject, "predicate": t.predicate, "object": t.obj, "claim_span": t.claim_span}
+                    for t in r["triples"]
+                ]
+                _render_triples(rows, "-- no triples extracted")
+    else:
+        st.caption("No extraction results yet. Run Step 4 first.")
+
+    # ================================================================
+    # STEP 6 — Write to Neo4j
+    # ================================================================
+    st.markdown('<div class="step-header">Step 6 -- Write to Neo4j</div>', unsafe_allow_html=True)
+
+    col_w, col_f, col_c = st.columns([2, 1, 1])
+    with col_w:
+        write_btn = st.button(
+            "Write to Neo4j",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                neo4j is None
+                or not extract_data
+                or extract_data.get("sample_id") != selected.sample_id
+            ),
+        )
+    with col_f:
+        force_write = st.checkbox("Force re-write", value=False,
+                                   help="Delete existing edges for these passages and re-write.")
+    with col_c:
+        clear_btn = st.button("Clear Graph", use_container_width=True, disabled=(neo4j is None))
+
+    if clear_btn and neo4j:
+        neo4j.clear_graph()
+        st.cache_resource.clear()
+        st.success("Graph cleared. The registry `processed_ids.txt` was NOT touched: "
+                   "use 'Force re-write' to reprocess.")
+        st.rerun()
+
+    if write_btn and neo4j and extract_data:
+        from src.ingestion.graph_writer import GraphWriter
+        from src.ingestion.processed_registry import ProcessedRegistry
+        from src.ingestion.output_store import save_ingest_report
+
+        writer = GraphWriter(client=neo4j)
+        registry = ProcessedRegistry()
+        ext_name = extract_data["extractor"]
+        total_written = 0
+        errors = []
+
+        with st.status(f"Writing triples to Neo4j ({ext_name})...", expanded=True) as stage:
+            for r in extract_data["results"]:
+                sid = r["source_id"]
+                triples = r["triples"]
+
+                if force_write:
+                    neo4j.delete_by_source(sid, ext_name)
+
+                if not triples:
+                    registry.mark(sid, ext_name, 0)
+                    continue
+
+                try:
+                    stage.update(label=f"Writing {len(triples)} triples for source_id={sid}...")
+                    written = writer.write_triples(triples)
+                    total_written += written
+                    registry.mark(sid, ext_name, written)
+                except Exception as exc:
+                    errors.append(f"{sid}: {exc}")
+                    stage.update(label=f"Error on {sid}: {exc}", state="error")
+
+            stage.update(
+                label=f"Done: {total_written} triples written to Neo4j ({ext_name})",
+                state="error" if errors else "complete",
+            )
+
+        # Save ingest report to JSONL
+        save_ingest_report(
+            sample_id=selected.sample_id,
+            question=selected.question,
+            extractor=ext_name,
+            total_triples=total_written,
+            docs_processed=len(extract_data["results"]),
+            docs_skipped=0,
+            zero_triple_docs=sum(1 for r in extract_data["results"] if not r["triples"]),
+            errors=errors,
+        )
+
+        for err in errors:
+            st.error(err)
+
+    # Show existing graph triples for this question
+    if neo4j and neo4j.is_connected():
+        with st.expander("Graph triples for this question (from Neo4j)", expanded=False):
+            for chunk in selected.docs():
+                sid = chunk["source_id"]
+                try:
+                    rows = neo4j.triples_by_source(sid, extractor=active_extractor)
+                except Exception:
                     rows = []
-                    if neo4j is not None:
-                        try:
-                            rows = neo4j.triples_by_source(sid, extractor=ext_name)
-                        except Exception as exc:
-                            st.caption(f"Neo4j: {exc}")
-                    doc_result = last.get(ext_name, {}).get(sid)
-                    if not rows and doc_result:
-                        # Fallback: run appena concluso ma grafo non interrogabile.
-                        rows = [
-                            {"subject": t.subject, "predicate": t.predicate,
-                             "object": t.obj, "claim_span": t.claim_span}
-                            for t in doc_result.triples
-                        ]
-                    msg = "— nessuna tripla estratta"
-                    if doc_result and doc_result.skipped:
-                        msg = "— già processato (nessuna tripla nel grafo)"
-                    elif doc_result and doc_result.error:
-                        msg = f"— errore: {doc_result.error}"
-                    _render_triples(rows, msg)
+                if rows:
+                    st.markdown(f"**source_id `{sid}` -- {chunk.get('title', '')}**")
+                    _render_triples(rows, "")
 
 
 with tab_ingest:
@@ -448,27 +622,27 @@ with tab_ingest:
 # ──────────────────────────────────────────────────────────────────────
 
 with tab_claim:
-    st.markdown("### Verifica Claim o Domanda")
+    st.markdown("### Verify Claim or Question")
     st.markdown(
         "<p style='color:#94a3b8;font-size:.9rem;'>"
-        "Inserisci un'affermazione (claim) <em>oppure</em> una domanda. "
-        "Le affermazioni vengono parsate via mREBEL e verificate sul grafo. "
-        "Le domande vengono convertite in tripla parziale via LLM e risolte "
-        "tramite pattern query + cosine similarity sul predicato."
+        "Enter a statement (claim) <em>or</em> a question. "
+        "Statements are parsed via mREBEL and verified against the graph. "
+        "Questions are converted to a partial triple via LLM and resolved "
+        "using pattern query + cosine similarity on the predicate."
         "</p>",
         unsafe_allow_html=True,
     )
 
     claim_input = st.text_area(
-        "Claim o domanda",
-        placeholder="es. 'Tenma è il protagonista di Monster' oppure 'Chi è il protagonista di Monster?'",
+        "Claim or question",
+        placeholder="e.g. 'Tenma is the protagonist of Monster' or 'Who is the protagonist of Monster?'",
         height=80,
     )
 
-    # Il filtro estrattore si applica a TUTTE le query di attribution:
-    # i grafi rebel/deepseek non vanno mai interrogati insieme.
+    # Extractor filter applies to ALL attribution queries:
+    # rebel/deepseek graphs must never be queried together.
     query_extractor = st.radio(
-        "Grafo da interrogare (estrattore)",
+        "Graph to query (extractor)",
         options=settings.AVAILABLE_EXTRACTORS,
         index=settings.AVAILABLE_EXTRACTORS.index(settings.ACTIVE_EXTRACTOR)
         if settings.ACTIVE_EXTRACTOR in settings.AVAILABLE_EXTRACTORS else 0,
@@ -476,7 +650,7 @@ with tab_claim:
     )
 
     verify_btn = st.button(
-        "🔍 Verifica / Rispondi",
+        "Verify / Answer",
         type="primary",
         disabled=(not claim_input.strip() or neo4j is None),
     )
@@ -486,6 +660,7 @@ with tab_claim:
 
     if verify_btn and claim_input.strip() and neo4j:
         from src.attribution.claim_attributor import ClaimAttributor
+        from src.ingestion.output_store import save_attribution
 
         attributor = ClaimAttributor(
             client=neo4j,
@@ -493,20 +668,20 @@ with tab_claim:
             extractor=query_extractor,
         )
 
-        with st.spinner("Parsing input e query sul grafo..."):
+        with st.spinner("Parsing input and querying graph..."):
             result = attributor.attribute(claim_input.strip())
 
-        mode_label = "❓ Domanda" if result.is_question else "📝 Claim"
-        st.caption(f"Modalità rilevata: **{mode_label}**")
+        mode_label = "Question" if result.is_question else "Claim"
+        st.caption(f"Detected mode: **{mode_label}**")
 
-        # ── Show parsed/resolved triple ───────────────────────────
-        triple_header = "Risposta (tripla risolta dal grafo)" if result.is_question else "Parsed Triple"
+        # -- Show parsed/resolved triple -----------------------------------
+        triple_header = "Answer (triple resolved from graph)" if result.is_question else "Parsed Triple"
         st.markdown(f"#### {triple_header}")
         if result.match_type == "parse_error":
-            msg = result.source_chunk or "Impossibile parsare l'input."
+            msg = result.source_chunk or "Unable to parse input."
             st.error(msg)
         elif result.match_type == "not_found" and not result.subject and not result.obj:
-            st.warning("Nessuna tripla corrispondente trovata nel grafo.")
+            st.warning("No matching triple found in the graph.")
         else:
             answer_class = {
                 "subject": ("triple-tag-answer", "triple-tag", "triple-tag"),
@@ -524,13 +699,13 @@ with tab_claim:
                 unsafe_allow_html=True,
             )
 
-        # ── Show attribution result ───────────────────────────────
+        # -- Show attribution result ---------------------------------------
         st.markdown("#### Verification Result")
 
         if result.match_type == "exact":
             st.markdown(
-                f"""<div class="result-exact">
-                    <strong>✅ EXACT MATCH</strong><br>
+                """<div class="result-exact">
+                    <strong>EXACT MATCH</strong><br>
                     Triple found verbatim in the knowledge graph.
                 </div>""",
                 unsafe_allow_html=True,
@@ -538,7 +713,7 @@ with tab_claim:
         elif result.match_type == "semantic":
             st.markdown(
                 f"""<div class="result-semantic">
-                    <strong>🟡 SEMANTIC MATCH</strong> — similarity: {result.similarity:.3f}<br>
+                    <strong>SEMANTIC MATCH</strong> -- similarity: {result.similarity:.3f}<br>
                     Predicate matched via cosine similarity (threshold: {semantic_threshold}).
                 </div>""",
                 unsafe_allow_html=True,
@@ -547,15 +722,15 @@ with tab_claim:
             sim_str = f" (best similarity: {result.similarity:.3f})" if result.similarity > 0 else ""
             st.markdown(
                 f"""<div class="result-notfound">
-                    <strong>❌ NOT FOUND</strong>{sim_str}<br>
-                    No matching triple in graph — claim cannot be attributed.
+                    <strong>NOT FOUND</strong>{sim_str}<br>
+                    No matching triple in graph -- claim cannot be attributed.
                 </div>""",
                 unsafe_allow_html=True,
             )
         elif result.match_type == "parse_error":
             pass  # already shown above
 
-        # ── Source evidence ───────────────────────────────────────
+        # -- Source evidence -----------------------------------------------
         if result.source_chunk and result.match_type != "parse_error":
             st.markdown("#### Source Evidence")
             col1, col2 = st.columns([3, 1])
@@ -569,11 +744,25 @@ with tab_claim:
                     f"""<div class="card">
                         <h4>Metadata</h4>
                         <p>
-                            <strong>Titolo:</strong> {result.source_file}<br>
+                            <strong>Title:</strong> {result.source_file}<br>
                             <strong>source_id:</strong> {result.source_id or "n/a"}<br>
-                            <strong>Estrattore:</strong> {query_extractor}<br>
-                            <strong>Passaggio:</strong> #{result.chunk_index}
+                            <strong>Extractor:</strong> {query_extractor}<br>
+                            <strong>Passage:</strong> #{result.chunk_index}
                         </p>
                     </div>""",
                     unsafe_allow_html=True,
                 )
+
+        # Save attribution to JSONL
+        save_attribution(
+            claim=claim_input.strip(),
+            subject=result.subject,
+            predicate=result.predicate,
+            obj=result.obj,
+            match_type=result.match_type,
+            similarity=result.similarity,
+            source_chunk=result.source_chunk or "",
+            source_id=result.source_id or "",
+            extractor=query_extractor,
+            is_question=result.is_question,
+        )

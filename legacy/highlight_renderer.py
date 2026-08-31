@@ -4,10 +4,10 @@ Modulo Highlight Renderer — Visualizzazione Highlight Gradient per Streamlit.
 Genera HTML/CSS per colorare il testo generato con un gradient basato
 sullo score di supporto lessicale (ROUGE-L + Exact Match):
 
-  🟢  Verde intenso  →  score ≥ 0.8  (alto supporto)
-  🟡  Giallo         →  score 0.5–0.8  (supporto parziale)
-  🟠  Arancione      →  score 0.3–0.5  (supporto debole)
-  🔴  Rosso          →  score < 0.3  (potenziale allucinazione)
+  Green   -> score >= 0.8  (high support)
+  Yellow  -> score 0.5-0.8  (partial support)
+  Orange  -> score 0.3-0.5  (weak support)
+  Red     -> score < 0.3  (potential hallucination)
 
 Ogni frase ha un tooltip mouse-over che mostra:
   - Score di supporto, ROUGE-L e Exact Match
@@ -282,10 +282,10 @@ class HighlightRenderer:
         }[level]
 
         level_label = {
-            "high": "✅ High Support",
-            "medium": "⚠️ Partial",
-            "low": "🔶 Weak",
-            "none": "🔴 Hallucination Risk",
+            "high": "High Support",
+            "medium": "Partial",
+            "low": "Weak",
+            "none": "Hallucination Risk",
         }[level]
 
         # ── Costruzione del tooltip ───────────────────────────────
@@ -330,7 +330,7 @@ class HighlightRenderer:
                 )
                 tooltip += (
                     f"<div style='margin-top:8px; margin-bottom:4px; font-weight:bold; font-size:0.8rem; color:{border_color};'>"
-                    f"📄 Database Chunk: {source_escaped}"
+                    f"Database Chunk: {source_escaped}"
                     f"</div>"
                 )
 

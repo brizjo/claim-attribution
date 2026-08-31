@@ -89,3 +89,9 @@ Architectural note from user (2026-04-27):
 - [x] `DEEPSEEK_TEMPERATURE = 0.0` su tutte le chiamate
 - [x] UI: rimosso selettore modello Ollama e badge; resta il badge DeepSeek
 - [x] Verificato live: ping API, estrazione su passaggio ALCE, question parser IT+EN, AppTest senza eccezioni
+
+## Phase 13: Timing extract() REBEL (2026-08-23)
+- [x] `DocResult.extract_seconds` in `alce_ingestor.py` — timer isolato su `extractor.extract()`, esclusi coref/embedding/write
+- [x] UI: caption "⏱ extract() REBEL: Xs · N triple · source_id · chunk_index" solo per estrattore REBEL, dopo ingestione
+- Device REBEL già auto-cuda se disponibile (`TripleExtractor._load()`), nessuna modifica necessaria
+- [x] Bug: `ingest_btn` falliva con `ServiceUnavailable` se Neo4j offline (is_processed → client lazy-fails). Aggiunto bottone "🧪 Debug extract REBEL (no DB, no write)" in `app.py` — usa `get_debug_rebel_extractor()`/`get_debug_coref_resolver()` (cache_resource dedicati, no Neo4jClient), ancora claim_span con `span_matcher.best_span` in locale, mostra triple/tempo/passaggio senza toccare il grafo

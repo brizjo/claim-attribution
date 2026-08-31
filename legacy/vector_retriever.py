@@ -100,19 +100,19 @@ class VectorRetriever:
         if self._db_ready:
             if progress_callback:
                 progress_callback(
-                    f"✅ Vector DB caricato da disco: {self.document_count} chunks"
+                    f"Vector DB loaded from disk: {self.document_count} chunks"
                 )
             return self.document_count
 
         # DB vuoto → build completo
         if progress_callback:
-            progress_callback("📥 Downloading dataset da HuggingFace...")
+            progress_callback("Downloading dataset from HuggingFace...")
 
         articles = self._fetch_dataset()
 
         if progress_callback:
             progress_callback(
-                f"✂️ Chunking di {len(articles)} documenti..."
+                f"Chunking {len(articles)} documents..."
             )
 
         n_chunks = self._index_articles(articles, progress_callback)
@@ -120,7 +120,7 @@ class VectorRetriever:
 
         if progress_callback:
             progress_callback(
-                f"✅ Indicizzati {n_chunks} chunks con BGE-M3. "
+                f"Indexed {n_chunks} chunks with BGE-M3. "
                 f"DB salvato in {self.persist_directory}"
             )
 
@@ -373,7 +373,7 @@ class VectorRetriever:
 
             if progress_callback:
                 progress_callback(
-                    f"🧠 Embedding batch {start//batch_size + 1}/"
+                    f"Embedding batch {start//batch_size + 1}/"
                     f"{(total + batch_size - 1)//batch_size} "
                     f"({end}/{total} chunks)..."
                 )

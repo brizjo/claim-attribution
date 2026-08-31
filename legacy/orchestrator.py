@@ -239,7 +239,7 @@ class InGenerationOrchestrator:
 
             if status_callback:
                 status_callback(
-                    f"🔍 CERCA #{iteration}: \"{cerca_query}\" — Ricerca in corso..."
+                    f"CERCA #{iteration}: \"{cerca_query}\" -- Searching..."
                 )
 
             # Cerca nel vector DB
@@ -262,7 +262,7 @@ class InGenerationOrchestrator:
 
             if status_callback:
                 status_callback(
-                    f"📄 Trovati {len(retrieved)} chunks. Riprendo generazione..."
+                    f"Found {len(retrieved)} chunks. Resuming generation..."
                 )
 
             # Riprendi la generazione con il contesto iniettato
@@ -289,7 +289,7 @@ class InGenerationOrchestrator:
         if iteration == 0 and not all_sources:
             if status_callback:
                 status_callback(
-                    "⚠️ No CERCA detected — Fallback: searching with original question..."
+                    "No CERCA detected -- Fallback: searching with original question..."
                 )
 
             retrieved = self.retriever.query(question, top_k=self.top_k)
@@ -308,8 +308,8 @@ class InGenerationOrchestrator:
 
             if status_callback:
                 status_callback(
-                    f"📄 Fallback: trovati {len(retrieved)} chunks. "
-                    f"Rigenerando con contesto..."
+                    f"Fallback: found {len(retrieved)} chunks. "
+                    f"Regenerating with context..."
                 )
 
             # Rigenera la risposta con il contesto recuperato
@@ -324,13 +324,13 @@ class InGenerationOrchestrator:
 
         # ── Step 3: Raffinamento ──────────────────────────────────
         if status_callback:
-            status_callback("✨ Raffinamento del testo intermedio...")
+            status_callback("Refining intermediate text...")
 
         result.final_response = self._refine_response(accumulated_text)
 
         if status_callback:
             status_callback(
-                f"✅ Completato con {iteration} ricerche CERCA"
+                f"Completed with {iteration} CERCA searches"
             )
 
         return result

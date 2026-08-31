@@ -3,6 +3,14 @@ from .alce_ingestor import AlceIngestor, DocResult, IngestReport, build_extracto
 from .coref_resolver import CoreferenceResolver
 from .deepseek_extractor import DeepSeekExtractor
 from .graph_writer import GraphWriter
+from .output_store import (
+    save_coref,
+    save_triple,
+    save_triples_batch,
+    save_attribution,
+    save_ingest_report,
+    load_jsonl,
+)
 from .processed_registry import ProcessedRegistry
 from .triple_extractor import Triple, TripleExtractor
 
@@ -19,4 +27,10 @@ __all__ = [
     "ProcessedRegistry",
     "Triple",
     "TripleExtractor",
+    "save_coref",
+    "save_triple",
+    "save_triples_batch",
+    "save_attribution",
+    "save_ingest_report",
+    "load_jsonl",
 ]
