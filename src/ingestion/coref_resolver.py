@@ -37,7 +37,33 @@ class CoreferenceResolver:
             return text
         try:
             preds = self._model.predict(texts=[text])
-            return preds[0].get_resolved_text()
+            return self._resolve_clusters(preds[0])
         except Exception as exc:
             logger.warning("fastcoref predict failed (%s) — skipping coref", exc)
             return text
+
+    @staticmethod
+    def _resolve_clusters(result) -> str:
+        """
+        fastcoref's CorefResult has no built-in text-rewrite method (only
+        get_clusters()/get_logit()) — build the resolved text ourselves:
+        each cluster's mentions are replaced by that cluster's longest
+        mention (proper nouns like "Tenma" beat pronouns like "he").
+        Replacements applied right-to-left so char offsets stay valid.
+        """
+        text = result.text
+        replacements: list[tuple[int, int, str]] = []
+        for cluster in result.get_clusters(as_strings=False):
+            spans = [s for s in cluster if s and None not in s]
+            if len(spans) < 2:
+                continue
+            canonical_start, canonical_end = max(spans, key=lambda s: s[1] - s[0])
+            canonical_text = text[canonical_start:canonical_end]
+            for start, end in spans:
+                if (start, end) == (canonical_start, canonical_end):
+                    continue
+                replacements.append((start, end, canonical_text))
+
+        for start, end, replacement in sorted(replacements, reverse=True):
+            text = text[:start] + replacement + text[end:]
+        return text

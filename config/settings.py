@@ -18,9 +18,20 @@ SENTENCE_TRANSFORMERS_HOME = os.path.join(HF_HOME, "sentence_transformers")
 os.environ["HF_HOME"] = HF_HOME
 os.environ["HF_HUB_CACHE"] = os.path.join(HF_HOME, "hub")           # Model weights
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_HOME, "hub")  # Legacy alias
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_HOME, "transformers")
+# TRANSFORMERS_CACHE deliberately NOT set: it's deprecated (transformers
+# warns to use HF_HOME) and, worse, points to a second cache dir separate
+# from HF_HUB_CACHE — a corrupted/incomplete download there (e.g. from an
+# interrupted run) is read instead of the good copy in HF_HUB_CACHE, with
+# no fallback. Single cache root only.
 os.environ["SENTENCE_TRANSFORMERS_HOME"] = SENTENCE_TRANSFORMERS_HOME
 os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_HOME, "datasets") # Dataset cache
+# Offline once cached: skip the online freshness/etag check on every load.
+# That check is what stalls (0 B for minutes) on a flaky connection even
+# when the model is already fully cached. Set HF_ALLOW_ONLINE=1 in the
+# environment to temporarily re-enable network (e.g. to pull a new model).
+if not os.getenv("HF_ALLOW_ONLINE"):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TORCH_HOME"] = os.path.join(HF_HOME, "torch")           # PyTorch models
 os.environ["XDG_CACHE_HOME"] = HF_HOME                              # Generic fallback
 
@@ -57,7 +68,7 @@ _load_dotenv()
 # -- Neo4j -----------------------------------------------------------------
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "dr4gh3770")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 # Target database (Neo4j 4+). Keep as "neo4j" unless you created another.
 # CRITICAL: must match the database your Neo4j Browser is connected to.
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")

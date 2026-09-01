@@ -111,6 +111,23 @@ class AlceIngestor:
         self._registry = registry or ProcessedRegistry()
         self._writer = GraphWriter(client=client) if client else None
         self._use_coref = use_coref
+        self._nlp = None  # lazy-loaded spaCy model for sentence splitting
+
+    def _get_nlp(self):
+        """Lazily load the spaCy model (reused across calls)."""
+        if self._nlp is None:
+            import spacy
+            try:
+                self._nlp = spacy.load(settings.SPACY_MODEL)
+            except OSError:
+                import spacy
+                self._nlp = spacy.blank("en")
+                self._nlp.add_pipe("sentencizer")
+                logger.warning(
+                    "spaCy model %s not found — using blank sentencizer",
+                    settings.SPACY_MODEL,
+                )
+        return self._nlp
 
     @property
     def extractor_name(self) -> str:
@@ -230,11 +247,16 @@ class AlceIngestor:
                 resolved_text=resolved,
             )
 
-            # 2. Extract triples from resolved text.
+            # 2. Sentence-tokenize resolved text, then extract triples.
             if progress:
                 progress(f"{self.extractor_name}: extracting {source_id}...")
             t_extract = time.time()
-            raw_triples = self._extractor.extract([{**chunk, "text": resolved}])
+            sents = [s.text.strip() for s in self._get_nlp()(resolved).sents
+                     if s.text.strip()]
+            if not sents:
+                sents = [resolved]
+            sent_chunks = [{**chunk, "text": s} for s in sents]
+            raw_triples = self._extractor.extract(sent_chunks)
             result.extract_seconds = time.time() - t_extract
 
             # 3. chunk_text = ORIGINAL text (evidence must be verbatim);

@@ -67,8 +67,8 @@ class ClaimAttributor:
         # Filtro di provenienza: le query toccano SOLO gli archi di questo
         # estrattore, così i grafi rebel/deepseek non si mescolano.
         # None = nessun filtro (interroga tutto il grafo).
-        self._extractor = extractor
-        self._extractor = TripleExtractor()
+        self._extractor_filter = extractor
+        self._parser = TripleExtractor()
         self._qparser: Optional[QuestionParser] = None
         self._encoder = None
 
@@ -116,7 +116,7 @@ class ClaimAttributor:
     def _attribute_claim(self, claim: str) -> AttributionResult:
         dummy_chunk = {"text": claim, "source_file": "claim", "chunk_index": 0}
         try:
-            triples = self._extractor.extract([dummy_chunk])
+            triples = self._parser.extract([dummy_chunk])
         except Exception as e:
             return AttributionResult(
                 claim=claim,
@@ -145,7 +145,7 @@ class ClaimAttributor:
 
         # Stage 1: exact match
         exact = self._client.exact_match(
-            t.subject, t.predicate, t.obj, extractor=self._extractor
+            t.subject, t.predicate, t.obj, extractor=self._extractor_filter
         )
         if exact:
             result.match_type = "exact"
@@ -161,7 +161,7 @@ class ClaimAttributor:
         # Stage 2: semantic fallback (predicate cosine, S/O fixed)
         pred_emb = self._embed(t.predicate)
         candidates = self._client.semantic_fallback(
-            t.subject, t.obj, pred_emb, extractor=self._extractor
+            t.subject, t.obj, pred_emb, extractor=self._extractor_filter
         )
 
         if candidates:
@@ -208,7 +208,7 @@ class ClaimAttributor:
             obj=spec.object,
             predicate_embedding=pred_emb,
             top_k=5,
-            extractor=self._extractor,
+            extractor=self._extractor_filter,
         )
 
         answer_field = spec.unknown_field() or ""

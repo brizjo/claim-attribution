@@ -17,7 +17,10 @@ fastcoref>=2.1.6
 python-dotenv>=1.0.0
 
 # --- Triple extraction (mREBEL) ---
-transformers>=4.35.0
+# PINNED <4.56: fastcoref 2.1.6 calls init_weights() instead of post_init(),
+# so `all_tied_weights_keys` (set in post_init since the transformers 4.56
+# tied-weights refactor) is missing at load time → silent coref skip.
+transformers>=4.41.0,<4.56
 torch>=2.0.0
 sentencepiece>=0.2.0   # required by mBART tokenizer for mREBEL
 

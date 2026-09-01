@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 os.environ["HF_HOME"] = r"D:\hf_home"
 os.environ["HF_HUB_CACHE"] = r"D:\hf_home\hub"
 os.environ["HUGGINGFACE_HUB_CACHE"] = r"D:\hf_home\hub"
-os.environ["TRANSFORMERS_CACHE"] = r"D:\hf_home\transformers"
+# TRANSFORMERS_CACHE deliberately NOT set — see config/settings.py comment:
+# it's a second cache root separate from HF_HUB_CACHE, and a stale/incomplete
+# blob there gets re-downloaded every session instead of using the good copy.
 os.environ["SENTENCE_TRANSFORMERS_HOME"] = r"D:\hf_home\sentence_transformers"
 os.environ["HF_DATASETS_CACHE"] = r"D:\hf_home\datasets"
 os.environ["TORCH_HOME"] = r"D:\hf_home\torch"
@@ -133,6 +135,24 @@ def get_debug_rebel_extractor():
 def get_debug_coref_resolver():
     from src.ingestion.coref_resolver import CoreferenceResolver
     return CoreferenceResolver()
+
+
+@st.cache_resource
+def get_graph_writer():
+    """One GraphWriter — keeps its SentenceTransformer loaded across writes."""
+    from src.ingestion.graph_writer import GraphWriter
+    return GraphWriter(client=get_neo4j_client())
+
+
+@st.cache_resource
+def get_attributor(semantic_threshold: float, extractor: str):
+    """One ClaimAttributor per (threshold, extractor) — keeps REBEL + encoder loaded."""
+    from src.attribution.claim_attributor import ClaimAttributor
+    return ClaimAttributor(
+        client=get_neo4j_client(),
+        semantic_threshold=semantic_threshold,
+        extractor=extractor,
+    )
 
 
 # ====================================================================
@@ -548,11 +568,10 @@ def _render_ingest_tab() -> None:
         st.rerun()
 
     if write_btn and neo4j and extract_data:
-        from src.ingestion.graph_writer import GraphWriter
         from src.ingestion.processed_registry import ProcessedRegistry
         from src.ingestion.output_store import save_ingest_report
 
-        writer = GraphWriter(client=neo4j)
+        writer = get_graph_writer()
         registry = ProcessedRegistry()
         ext_name = extract_data["extractor"]
         total_written = 0
@@ -659,14 +678,9 @@ with tab_claim:
         st.warning("Neo4j not connected. Start Neo4j Desktop first.")
 
     if verify_btn and claim_input.strip() and neo4j:
-        from src.attribution.claim_attributor import ClaimAttributor
         from src.ingestion.output_store import save_attribution
 
-        attributor = ClaimAttributor(
-            client=neo4j,
-            semantic_threshold=semantic_threshold,
-            extractor=query_extractor,
-        )
+        attributor = get_attributor(semantic_threshold, query_extractor)
 
         with st.spinner("Parsing input and querying graph..."):
             result = attributor.attribute(claim_input.strip())
