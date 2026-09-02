@@ -15,12 +15,11 @@ l'ingestione dell'intero dataset (948×5 = 4740 chiamate) va fatta a lotti.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from config import settings
 from src.ingestion.triple_extractor import Triple
 from src.llm.deepseek_client import DeepSeekClient
+from src.llm import json_repair
 
 logger = logging.getLogger(__name__)
 
@@ -78,41 +77,17 @@ def build_messages(text: str, title: str = "") -> list[dict]:
 # Parsing risposta
 # ────────────────────────────────────────────────────────────────────
 
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
-
-
 def parse_response(content: str) -> list[dict]:
     """
     Estrae la lista di triple dalla risposta.
 
-    Tollera markdown fence o testo attorno al JSON: si isola il blocco
-    `{...}` più esterno prima del parse.  Ritorna [] su output non parsabile
-    (loggato): un passaggio senza triple è un dato valido, non un crash.
+    Tollera markdown fence, testo attorno al JSON e JSON sintatticamente rotto
+    (`src/llm/json_repair.py`): il JSON mode di DeepSeek in produzione emette a
+    volte un array non chiuso, e un parse secco perderebbe l'intero passaggio.
+    Ritorna [] solo se non si recupera nemmeno un record.
     """
-    if not content:
-        return []
-    raw = content.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw[raw.find("{"):] if "{" in raw else raw
-    match = _JSON_BLOCK.search(raw)
-    if not match:
-        logger.warning("DeepSeek: nessun JSON nella risposta (%.120s)", raw)
-        return []
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        logger.warning("DeepSeek: JSON non valido (%s) — %.120s", exc, raw)
-        return []
-
-    items = data.get("triples", data) if isinstance(data, dict) else data
-    if not isinstance(items, list):
-        return []
-
     out = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
+    for item in json_repair.records(content or "", "triples"):
         subject = str(item.get("subject", "")).strip()
         predicate = str(item.get("predicate", "")).strip()
         obj = str(item.get("object", item.get("obj", ""))).strip()
@@ -142,6 +117,11 @@ class DeepSeekExtractor:
     @property
     def model(self) -> str:
         return self._client.model
+
+    @property
+    def client(self) -> DeepSeekClient:
+        # Riusato da HybridExtractor: stesso trasporto, prompt diversi.
+        return self._client
 
     # ── Health check (delegato al client) ───────────────────────────
 

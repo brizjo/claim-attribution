@@ -70,3 +70,91 @@ def best_span(text: str, *cues: str) -> str:
             best, best_score = sent, score
 
     return best or text.strip()
+
+
+# ────────────────────────────────────────────────────────────────────
+# Ancoraggio verbatim (pipeline ibrida) — lo span DEVE contenere S e O
+# ────────────────────────────────────────────────────────────────────
+
+def content_tokens(text: str) -> set[str]:
+    """Token non-stopword, lowercase — unità di confronto per l'ancoraggio."""
+    return _tokens(text)
+
+
+def contains_cue(span: str, cue: str) -> bool:
+    """
+    True se TUTTI i content token di `cue` compaiono in `span` (token-level).
+
+    Tollera ordine e articoli diversi ("Obama Barack" ⊆ "Barack Obama was...")
+    ma NON parole assenti dal testo ("President Obama" su uno span che non
+    dice "president" → False).  Un cue senza content token (es. il pronome
+    "it") non è ancorabile: False.
+    """
+    cue_tok = _tokens(cue)
+    if not cue_tok:
+        return False
+    return cue_tok <= _tokens(span)
+
+
+def _windows(sentences: list[str], size: int) -> list[tuple[int, int]]:
+    return [(i, i + size) for i in range(0, max(0, len(sentences) - size + 1))]
+
+
+def anchor_span(
+    text: str,
+    subject: str,
+    obj: str,
+    max_window: int = 2,
+) -> str | None:
+    """
+    Frase (o finestra di `max_window` frasi consecutive) di `text` che contiene
+    sia `subject` sia `obj` a livello di token.  `None` se non esiste: la
+    tripla non è ancorabile e va scartata dai guardrail.
+    """
+    sentences = split_sentences(text)
+    if not sentences:
+        return None
+    for size in range(1, max_window + 1):
+        for start, end in _windows(sentences, size):
+            span = " ".join(sentences[start:end])
+            if contains_cue(span, subject) and contains_cue(span, obj):
+                return span
+    return None
+
+
+def anchor_span_aligned(
+    original: str,
+    resolved: str,
+    subject: str,
+    obj: str,
+    max_window: int = 2,
+) -> tuple[str, str] | None:
+    """
+    Ritorna `(span_original, span_resolved)` — l'evidenza verbatim sul testo
+    ORIGINALE e la stessa finestra sul testo coref-risolto.
+
+    Serve perché il modello vede il testo risolto ("Barack Obama was born...")
+    mentre il testo originale dice "He was born...": ancorare S/O direttamente
+    sull'originale scarterebbe triple corrette.  Si ancora sul risolto e si
+    riporta la finestra sull'originale per indice di frase (la coref sostituisce
+    menzioni in-place, quindi il numero di frasi si conserva).  Se i due split
+    non hanno lo stesso numero di frasi si ricade sull'ancoraggio diretto
+    sull'originale (nessuna evidenza inventata).
+    """
+    orig_sents = split_sentences(original)
+    res_sents = split_sentences(resolved or original)
+
+    if not orig_sents:
+        return None
+
+    if len(orig_sents) == len(res_sents):
+        for size in range(1, max_window + 1):
+            for start, end in _windows(res_sents, size):
+                span_res = " ".join(res_sents[start:end])
+                if contains_cue(span_res, subject) and contains_cue(span_res, obj):
+                    return " ".join(orig_sents[start:end]), span_res
+
+    span_orig = anchor_span(original, subject, obj, max_window=max_window)
+    if span_orig is not None:
+        return span_orig, span_orig
+    return None

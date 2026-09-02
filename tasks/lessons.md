@@ -121,3 +121,40 @@
   `requirements.txt` non c'era nulla da togliere, solo commenti da correggere.
 - Verificato live con la chiave reale: ping API ok, 10 triple estratte da un
   passaggio ALCE con `claim_span` verbatim, question parser IT+EN corretto.
+
+## Fase 15 — Pipeline ibrida REBEL + DeepSeek (2026-09-01)
+
+- **Lo span va ancorato sul testo coref-RISOLTO, salvato dal testo ORIGINALE.**
+  Il modello vede "Barack Obama served as..." mentre l'originale dice "He served
+  as...": pretendere subject/object dentro lo span *originale* scarterebbe le
+  triple corrette. `anchor_span_aligned` cerca la finestra sul risolto e riporta
+  la stessa finestra sull'originale per indice di frase (la coref sostituisce
+  menzioni in-place, il numero di frasi si conserva); se i due split hanno un
+  numero di frasi diverso si ricade sull'ancoraggio diretto sull'originale.
+- **Il JSON mode di DeepSeek NON garantisce JSON valido.** In un run reale il
+  validatore ha restituito `...}}` invece di `...}]}`: con `json.loads` secco
+  tutti e 9 i verdetti sparivano e TUTTE le triple REBEL risultavano "rigettate"
+  — cioe' esattamente la metrica che serve a decidere se tenere REBEL, falsata
+  al 100% senza un solo errore a schermo. `src/llm/json_repair.py` chiude le
+  parentesi rimaste aperte e, come ultima risorsa, parsa i singoli oggetti
+  bilanciati. *Lezione: un parser LLM che ritorna [] su errore va sempre letto
+  come "quanti record ho perso in silenzio?", non come "il modello non ha
+  prodotto nulla".*
+- **La provenienza non si chiede all'LLM, si calcola.** Il flag `from_rebel` del
+  prompt e' inaffidabile: `origin` viene dal confronto (subject, object) a
+  livello di content token tra candidati REBEL e set finale. Il predicato e'
+  escluso dalla chiave perche' l'LLM lo *corregge* e la tripla resta la stessa
+  proposta di REBEL.
+- **Contare le triple REBEL "tenute" sulle triple FINALI sbaglia i totali.** Due
+  candidati REBEL con lo stesso (S, O) e predicati diversi collassano in una
+  sola tripla finale: `rebel_kept` (triple finali con origin rebel) e' <=
+  `rebel_matched` (candidati REBEL confluiti). L'invariante da testare e'
+  `rebel_matched + rebel_rejected == rebel_raw`, e nell'accounting il candidato
+  gia' bocciato dal validatore va controllato PRIMA di quelli tenuti, altrimenti
+  finisce in entrambi i conteggi.
+- `extractor` non e' piu' una proprieta' della tripla: la pipeline e' una sola.
+  Nei JSONL ibridi resta solo `origin` (`deepseek` | `rebel_confirmed`), utile
+  per contare offline il contributo di REBEL.
+- Guardrail: predicato senza content token ("is a") = nessuna asserzione, si
+  scarta. Stessa regola per subject/object composti solo da stopword ("it"):
+  senza content token la tripla non e' ancorabile a nessuno span.

@@ -11,6 +11,13 @@ Produced files (under settings.OUTPUT_DIR):
     triples_extracted.jsonl     each (S, P, O) + claim_span + source_id
     attribution_results.jsonl   claim attribution outcomes
     ingest_reports.jsonl        per-question ingestion summaries
+
+Pipeline ibrida REBEL+DeepSeek (nessun campo `extractor`: la pipeline è una
+sola, `origin` dice solo quale modello ha proposto la tripla):
+
+    triples_hybrid.jsonl            triple sopravvissute ai guardrail
+    triples_hybrid_discarded.jsonl  triple scartate + motivo del guardrail
+    hybrid_runs.jsonl               statistiche per run (variante A / B)
 """
 
 from __future__ import annotations
@@ -170,6 +177,82 @@ def save_ingest_report(
         "errors": errors,
         "timestamp": _timestamp(),
     })
+
+
+# ── Pipeline ibrida (REBEL + DeepSeek) ────────────────────────────────
+
+
+def _hybrid_record(
+    t, passage, sample_id: str, variant: str, ts: str, with_reason: bool = False,
+) -> dict:
+    """Un record JSONL da una `HybridTriple` + il suo `PassageResult`."""
+    record = {
+        "sample_id": sample_id,
+        "variant": variant,
+        "source_id": passage.source_id,
+        "title": passage.title,
+        "chunk_index": passage.chunk_index,
+        "subject": t.subject,
+        "predicate": t.predicate,
+        "object": t.obj,
+        "claim_span": t.claim_span,
+        "chunk_text": passage.original_text,
+        "origin": t.origin,
+        "timestamp": ts,
+    }
+    if with_reason:
+        record["discard_reason"] = t.reason
+    return record
+
+
+def save_hybrid_report(report) -> dict[str, int]:
+    """
+    Persiste un `RunReport` della pipeline ibrida: triple sopravvissute,
+    triple scartate (con motivo) e statistiche di run.
+
+    Ritorna i conteggi scritti — utili per la conferma in UI.
+    """
+    ts = _timestamp()
+    survived_path = _BASE / "triples_hybrid.jsonl"
+    discarded_path = _BASE / "triples_hybrid_discarded.jsonl"
+    _ensure_dir(survived_path)
+
+    n_survived = n_discarded = 0
+    with survived_path.open("a", encoding="utf-8") as ok_fh, \
+            discarded_path.open("a", encoding="utf-8") as ko_fh:
+        for passage in report.passages:
+            for t in passage.survived:
+                ok_fh.write(json.dumps(
+                    _hybrid_record(t, passage, report.sample_id, report.variant, ts),
+                    ensure_ascii=False) + "\n")
+                n_survived += 1
+            for t in passage.discarded:
+                ko_fh.write(json.dumps(
+                    _hybrid_record(t, passage, report.sample_id, report.variant, ts,
+                                   with_reason=True),
+                    ensure_ascii=False) + "\n")
+                n_discarded += 1
+
+    _append(_BASE / "hybrid_runs.jsonl", {
+        "sample_id": report.sample_id,
+        "question": report.question,
+        "variant": report.variant,
+        "passages": len(report.passages),
+        "produced": report.produced,
+        "survived": report.survived,
+        "discarded": report.produced - report.survived,
+        "rebel_produced": report.rebel_produced,
+        "rebel_matched": report.rebel_matched,
+        "rebel_kept": report.rebel_kept,
+        "rebel_rejected": report.rebel_rejected,
+        "discard_reasons": dict(report.discard_reasons),
+        "llm_calls": report.llm_calls,
+        "seconds": round(report.seconds, 3),
+        "errors": report.errors,
+        "timestamp": ts,
+    })
+
+    return {"survived": n_survived, "discarded": n_discarded}
 
 
 # ── Read helpers (for loading results back) ───────────────────────────

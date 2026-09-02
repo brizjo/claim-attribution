@@ -102,3 +102,54 @@ Architectural note from user (2026-04-27):
 - [x] fastcoref/transformers pin (`<4.56`) già presente in `requirements.txt` non committato — verificare `pip install -r requirements.txt` per allineare l'ambiente.
 - [x] **Root cause vero stall "pytorch_model.bin"**: `app.py` settava `TRANSFORMERS_CACHE=D:\hf_home\transformers`, secondo cache root separato da `HF_HUB_CACHE` (`D:\hf_home\hub`, dove il modello era già completo). Ogni sessione risolveva nel dir sbagliato/vuoto, trovava un blob `.incomplete` residuo e riscaricava tutto da zero (1.6GB REBEL + f-coref). Rimossa la riga in app.py; aggiunto `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1` in settings.py (override con `HF_ALLOW_ONLINE=1`).
 - [x] **fastcoref era ANCORA no-op silenzioso**: `coref_resolver.py` chiamava `.get_resolved_text()`, metodo inesistente su `CorefResult` di fastcoref 2.1.6 (esistono solo `get_clusters()`/`get_logit()`) — ogni chiamata cadeva nell'except e ritornava testo non risolto. Riscritto `_resolve_clusters()`: ricostruisce il testo risolto da `get_clusters(as_strings=False)`, sostituendo ogni menzione con la più lunga del cluster. Verificato: "He" → "Tenma" su frase di test.
+
+## Phase 15: Pipeline ibrida REBEL+DeepSeek — debug variants A/B (2026-09-01)
+
+Contesto: la pipeline non e' piu' "REBEL *oppure* DeepSeek" ma ibrida. REBEL rende
+poco -> serve misurare quanto contribuisce davvero (possibile rimozione futura).
+Neo4j fuori scopo: solo JSONL + UI.
+
+### Nuovi moduli
+- [x] `src/ingestion/guardrails.py` — scarto triple corrotte, un motivo per tripla:
+      `no_predicate`, `empty_subject`, `empty_object`, `subject_equals_object`,
+      `no_span`, `span_not_verbatim`, `subject_not_in_span`, `object_not_in_span`,
+      `subject_is_claim`, `object_is_claim` (+ `duplicate` a valle).
+- [x] `span_matcher.anchor_span` / `anchor_span_aligned` — finestra di 1-2 frasi che
+      contiene S e O a livello di content token. `anchor_span_aligned` ancora sul testo
+      coref-RISOLTO e restituisce la finestra corrispondente sull'ORIGINALE: lo span
+      salvato resta verbatim, ma "He" nell'originale non fa scartare la tripla.
+- [x] `src/ingestion/hybrid_extractor.py` — varianti A (correct, 1 call/passaggio) e
+      B (2 passate, 2 call/passaggio) + conteggi REBEL.
+- [x] `src/llm/json_repair.py` — recupero JSON malformato dalle risposte LLM
+      (array non chiuso, virgole finali) con parse per-oggetto come ultima risorsa.
+      Collegato a `parse_response` (triple) e `parse_verdicts` (verdetti).
+- [x] `output_store.save_hybrid_report()` — `triples_hybrid.jsonl`,
+      `triples_hybrid_discarded.jsonl` (+ `discard_reason`), `hybrid_runs.jsonl`.
+      Nessun campo `extractor`; resta `origin` = `deepseek` | `rebel_confirmed`.
+
+### UI (Streamlit)
+- [x] Tab "Hybrid Debug (REBEL + DeepSeek)": scelta domanda, varianti A/B (anche
+      entrambe sullo stesso input coref), tabella per passaggio + totali
+      `triple prodotte | sopravvissute | scartate | REBEL prodotte | REBEL confermate |
+      REBEL rigettate | triple finali da REBEL | LLM calls | sec`, tabella dei motivi
+      di scarto, confronto A vs B, dettaglio per passaggio (originale, coref, REBEL
+      grezze, passata 1 DeepSeek, sopravvissute con span+origin, scartate, REBEL
+      rigettate con motivo).
+
+### Verifiche
+- [x] Test stub (REBEL/DeepSeek finti): span verbatim, guardrail su tutte le classi
+      di corruzione, invariante `rebel_matched + rebel_rejected == rebel_raw`.
+- [x] Test live (REBEL reale + DeepSeek reale, passaggio ALCE 6669150, entrambe le
+      varianti): A 16 triple / REBEL 9 -> 3 confermate, B 11 triple / REBEL 9 -> 2
+      confermate. Tutti gli span verbatim sul testo originale.
+- [x] `AppTest` headless: 3 tab, nessuna eccezione, Neo4j offline tollerato.
+
+### Aperto
+- [ ] Variante B: due triple con lo stesso (S, O) e predicati sinonimi (DeepSeek +
+      REBEL) sopravvivono entrambe — la dedup e' su (S, P, O). Serve decidere se
+      deduplicare per coppia o affidarsi al validatore.
+- [ ] Batch su N domande per una statistica REBEL affidabile (qui: 1 passaggio).
+- [ ] Scrittura Neo4j della pipeline ibrida (rimossa la proprieta' `extractor`).
+
+### Fuori scopo
+- Scrittura Neo4j (nessuna modifica a graph_writer/neo4j_client).
