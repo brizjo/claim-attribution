@@ -5,11 +5,13 @@ For each passage:
     skip-check -> coref -> triple extraction -> anchor claim_span on ORIGINAL
     text -> (optionally) embed predicates -> MERGE into Neo4j -> registry
 
-Two-phase architecture (2026-08-25 refactor):
+Three-phase architecture (canonicalization added 2026-09-03):
     1. extract_doc / extract_entry  — coref + extraction, produces DocResult
        with triples but does NOT touch Neo4j.  Output saved to JSONL.
-    2. write_doc / write_entry      — takes a DocResult, embeds predicates,
-       writes to Neo4j, marks registry.
+    2. canonicalize_entry           — unifica i nodi dentro lo scope scelto e
+       calcola `predicate_embedding` (un batch per domanda).  Ancora niente I/O.
+    3. write_doc / write_entry      — prende triple gia' canonicalizzate e gia'
+       embeddate, scrive su Neo4j, marca il registry.
 
 The legacy ingest_doc / ingest_entry methods remain as convenience wrappers
 that call both phases sequentially.
@@ -31,6 +33,10 @@ from config import settings
 from src.graph.neo4j_client import Neo4jClient
 from src.ingestion.alce_loader import AlceEntry
 from src.ingestion.coref_resolver import CoreferenceResolver
+from src.ingestion.entity_canonicalizer import (
+    CanonicalizationResult,
+    EntityCanonicalizer,
+)
 from src.ingestion.graph_writer import GraphWriter
 from src.ingestion.output_store import save_coref, save_triples_batch
 from src.ingestion.processed_registry import ProcessedRegistry
@@ -41,7 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 class Extractor(Protocol):
-    """Common interface for TripleExtractor (REBEL) and DeepSeekExtractor."""
+    """Interfaccia dell'estrattore di triple della pipeline (DeepSeek).
+
+    Resta un Protocol e non un tipo concreto perche' gli esperimenti iniettano
+    altri estrattori (REBEL, ibrido) sugli stessi stadi a valle."""
 
     name: str
 
@@ -76,6 +85,8 @@ class IngestReport:
     sample_id: str
     question: str
     docs: list[DocResult] = field(default_factory=list)
+    # Riepilogo della fase di canonicalizzazione (vuoto finche' non gira).
+    canonicalization: dict = field(default_factory=dict)
 
     @property
     def total_triples(self) -> int:
@@ -104,11 +115,14 @@ class AlceIngestor:
         resolver: Optional[CoreferenceResolver] = None,
         registry: Optional[ProcessedRegistry] = None,
         use_coref: bool = True,
+        canonicalizer: Optional[EntityCanonicalizer] = None,
     ):
         self._client = client
         self._extractor = extractor
         self._resolver = resolver or CoreferenceResolver()
         self._registry = registry or ProcessedRegistry()
+        # Il canonicalizer non carica nulla finche' non serve (encoder lazy).
+        self._canonicalizer = canonicalizer or EntityCanonicalizer()
         self._writer = GraphWriter(client=client) if client else None
         self._use_coref = use_coref
         self._nlp = None  # lazy-loaded spaCy model for sentence splitting
@@ -278,7 +292,27 @@ class AlceIngestor:
         return result
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 2: Write to Neo4j (takes already-extracted DocResult)
+    # Phase 2: Canonicalize (nodi unificati + predicate_embedding, NO Neo4j)
+    # ────────────────────────────────────────────────────────────────
+
+    def canonicalize_entry(
+        self,
+        report: IngestReport,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> CanonicalizationResult:
+        """
+        Unifica le menzioni delle triple estratte e calcola gli embedding dei
+        predicati.  Va eseguita FRA extract_entry e write_entry: e' il solo
+        momento in cui tutte le triple della domanda sono in memoria e nessuna
+        e' ancora scritta.
+        """
+        result = self._canonicalizer.canonicalize(report, progress=progress)
+        report.canonicalization = result.summary()
+        logger.info("Canonicalization: %s", report.canonicalization)
+        return result
+
+    # ────────────────────────────────────────────────────────────────
+    # Phase 3: Write to Neo4j (takes already-canonicalized DocResult)
     # ────────────────────────────────────────────────────────────────
 
     def write_entry(
@@ -343,8 +377,9 @@ class AlceIngestor:
         force: bool = False,
         progress: Optional[Callable[[str], None]] = None,
     ) -> IngestReport:
-        """Full pipeline: extract + write for all passages of an ALCE question."""
+        """Full pipeline: extract -> canonicalize -> write."""
         report = self.extract_entry(entry, skip_existing=skip_existing, progress=progress)
+        self.canonicalize_entry(report, progress=progress)
         self.write_entry(report, force=force, progress=progress)
         return report
 
@@ -362,14 +397,24 @@ class AlceIngestor:
         return result
 
 
-def build_extractor(name: str) -> Extractor:
-    """Factory for extractor name ("rebel" | "deepseek")."""
-    if name == settings.EXTRACTOR_REBEL:
-        from src.ingestion.triple_extractor import TripleExtractor
-        return TripleExtractor()
+def build_extractor(name: str = settings.EXTRACTOR_DEEPSEEK) -> Extractor:
+    """
+    Factory dell'estrattore della pipeline.  Un solo estrattore: DeepSeek.
+
+    REBEL e' stato tolto dalla pipeline principale (2026-09-03): sui 50
+    passaggi misurati confermava l'11-27% delle triple e la variante ancorata
+    al suo vocabolario produceva MENO triple e piu' povere (vedi
+    `tasks/todo.md`, fase ibrida).  Resta disponibile solo negli esperimenti.
+    """
     if name == settings.EXTRACTOR_DEEPSEEK:
         from src.ingestion.deepseek_extractor import DeepSeekExtractor
         return DeepSeekExtractor()
+    if name == settings.EXTRACTOR_REBEL:
+        raise ValueError(
+            "REBEL non fa piu' parte della pipeline principale: l'unico "
+            "estrattore e' DeepSeek.  Per confrontarli usa gli esperimenti "
+            "(SHOW_EXPERIMENTS=1) o scripts/run_hybrid_experiment.py."
+        )
     raise ValueError(
         f"Unknown extractor: {name!r} "
         f"(available: {settings.AVAILABLE_EXTRACTORS})"

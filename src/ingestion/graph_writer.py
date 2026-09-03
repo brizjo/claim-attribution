@@ -1,6 +1,10 @@
 """
-Graph writer — takes extracted triples, computes predicate embeddings,
-writes to Neo4j.
+Graph writer — scrive su Neo4j triple gia' canonicalizzate.
+
+Dal 2026-09-03 l'embedding dei predicati lo calcola la fase di
+canonicalizzazione (`src/ingestion/entity_canonicalizer.py`): un solo batch per
+domanda invece di uno per write.  Qui resta solo un fallback per le triple che
+arrivano senza `predicate_embedding` (percorsi legacy, UI passo-passo).
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from src.ingestion.triple_extractor import Triple
 
 
 class GraphWriter:
-    """Embeds predicate strings and writes triples to Neo4j."""
+    """Writes triples to Neo4j; embeds predicates solo se non gia' embeddati."""
 
     def __init__(
         self,
@@ -36,19 +40,28 @@ class GraphWriter:
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> int:
         """
-        Embed predicates and write triples to Neo4j.  Does NOT create a
-        Document node — call finalize_document() once after all chunks.
+        Write triples to Neo4j.  Does NOT create a Document node — call
+        finalize_document() once after all chunks.
+
+        `predicate_embedding` arriva dalla canonicalizzazione; viene calcolato
+        qui solo per le triple che ne sono prive.
         """
         if not triples:
             return 0
 
-        self._load_encoder()
-
-        predicates = [t.predicate for t in triples]
-        embeddings = self._encoder.encode(predicates, show_progress_bar=False)
+        missing = sorted({t.predicate for t in triples if not t.predicate_embedding})
+        table: dict[str, list[float]] = {}
+        if missing:
+            self._load_encoder()
+            for predicate, emb in zip(
+                missing, self._encoder.encode(missing, show_progress_bar=False)
+            ):
+                table[predicate] = [float(x) for x in emb]
 
         triples_dicts = []
-        for triple, emb in zip(triples, embeddings):
+        for triple in triples:
+            embedding = (list(triple.predicate_embedding)
+                         or table.get(triple.predicate, []))
             triples_dicts.append({
                 "subject": triple.subject,
                 "predicate": triple.predicate,
@@ -61,7 +74,13 @@ class GraphWriter:
                 "source_id": triple.source_id or f"{triple.source_file}#{triple.chunk_index}",
                 "extractor": triple.extractor,
                 "chunk_index": triple.chunk_index,
-                "predicate_embedding": emb.tolist(),
+                "predicate_embedding": embedding,
+                # Provenienza verbatim: la forma canonica sta sul nodo, la
+                # menzione com'era nel testo resta sull'arco.
+                "subject_surface": triple.subject_surface or triple.subject,
+                "object_surface": triple.object_surface or triple.obj,
+                "subject_external_id": triple.subject_external_id,
+                "object_external_id": triple.object_external_id,
             })
 
         return self._client.batch_write_triples(triples_dicts, progress_callback)

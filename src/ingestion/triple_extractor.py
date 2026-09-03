@@ -1,6 +1,13 @@
 """
-Triple extractor — uses REBEL (Babelscape/rebel-large, English BART) by
-default; auto-switches to mREBEL config when model name contains "mrebel".
+Triple extractor — REBEL (Babelscape/rebel-large, English BART); auto-switches
+to mREBEL config when model name contains "mrebel".
+
+FUORI DALLA PIPELINE PRINCIPALE (2026-09-03): l'unico estrattore
+dell'ingestione e dell'attribution e' DeepSeek.  `TripleExtractor` resta per
+gli esperimenti (`src/ui/experiments.py`, `scripts/run_hybrid_experiment.py`),
+che misurano quanto REBEL aggiunge a DeepSeek.  Il modulo resta comunque nella
+pipeline per un altro motivo: la NamedTuple `Triple` qui sotto e' il tipo di
+tripla usato da tutto il sistema.
 
 A single regex-tokenised parser handles both output formats:
   REBEL  : <triplet> SUBJ <subj> OBJ <obj> RELATION ...
@@ -28,6 +35,16 @@ class Triple(NamedTuple):
     source_id: str = ""      # doc["id"] ALCE — chiave di provenienza sull'arco
     extractor: str = ""      # "rebel" | "deepseek"
     claim_span: str = ""     # frase del chunk ORIGINALE che supporta la tripla
+    # ── Canonicalizzazione (fase pre-write, entity_canonicalizer.py) ──
+    # `*_surface` conserva la menzione verbatim: subject/obj diventano la forma
+    # canonica, ma la provenienza deve restare quella che il testo dice davvero.
+    subject_surface: str = ""
+    object_surface: str = ""
+    subject_external_id: str = ""    # ID esterno del nodo (stadio 3 del linking)
+    object_external_id: str = ""
+    # Embedding del predicato: calcolato in canonicalizzazione (un batch per
+    # domanda), non piu' in scrittura.  Vuoto = GraphWriter lo calcola da se'.
+    predicate_embedding: tuple = ()
 
 
 # Language tokens occasionally emitted by mBART-based mREBEL — skipped.
@@ -87,7 +104,11 @@ def _parse_rebel_output(text: str) -> list[tuple[str, str, str]]:
 
 
 class TripleExtractor:
-    """Extracts triples using REBEL (BART) or mREBEL (mBART) — auto-detected."""
+    """
+    Extracts triples using REBEL (BART) or mREBEL (mBART) — auto-detected.
+
+    Solo esperimenti: `build_extractor` non lo costruisce piu'.
+    """
 
     name = settings.EXTRACTOR_REBEL
 

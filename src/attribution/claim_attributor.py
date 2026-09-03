@@ -5,7 +5,11 @@ against the Neo4j knowledge graph.
 Two routes:
 
   1. Claim path (declarative input)
-       parse with mREBEL → exact match → semantic predicate-cosine fallback
+       parse with DeepSeek → exact match → semantic predicate-cosine fallback
+
+Simmetria di estrazione (requisito di `regole_progetto.md` §4): il claim viene
+parsato con lo STESSO estrattore che ha costruito il grafo.  Dal 2026-09-03
+quell'estrattore e' DeepSeek — REBEL e' fuori dalla pipeline principale.
 
   2. Question path (interrogative input)
        parse with DeepSeek into partial triple (?, P, O) / (S, ?, O) / (S, P, ?)
@@ -19,7 +23,7 @@ from typing import Optional
 
 from config import settings
 from src.graph.neo4j_client import Neo4jClient
-from src.ingestion.triple_extractor import TripleExtractor
+from src.ingestion.deepseek_extractor import DeepSeekExtractor
 from src.attribution.question_parser import QuestionParser, QuerySpec
 
 
@@ -65,10 +69,11 @@ class ClaimAttributor:
         self._threshold = semantic_threshold
         self._model_name = embedding_model
         # Filtro di provenienza: le query toccano SOLO gli archi di questo
-        # estrattore, così i grafi rebel/deepseek non si mescolano.
-        # None = nessun filtro (interroga tutto il grafo).
+        # estrattore, così un grafo vecchio (rebel) non si mescola con quello
+        # corrente.  None = nessun filtro (interroga tutto il grafo).
         self._extractor_filter = extractor
-        self._parser = TripleExtractor()
+        # Stesso estrattore dell'ingestione: simmetria di estrazione.
+        self._parser = DeepSeekExtractor()
         self._qparser: Optional[QuestionParser] = None
         self._encoder = None
 
@@ -114,6 +119,19 @@ class ClaimAttributor:
     # ────────────────────────────────────────────────────────────────
 
     def _attribute_claim(self, claim: str) -> AttributionResult:
+        # `DeepSeekExtractor.extract` logga e salta i chunk falliti: senza
+        # questo controllo una chiave mancante si presenterebbe come "nessuna
+        # tripla estratta", cioe' un fallimento silenzioso.
+        if not self._parser.is_available():
+            return AttributionResult(
+                claim=claim,
+                match_type="parse_error",
+                source_chunk=(
+                    "DeepSeek non e' configurato: serve `DEEPSEEK_API_KEY` "
+                    "nel file `.env` (vedi `.env.example`)."
+                ),
+            )
+
         dummy_chunk = {"text": claim, "source_file": "claim", "chunk_index": 0}
         try:
             triples = self._parser.extract([dummy_chunk])
@@ -121,7 +139,7 @@ class ClaimAttributor:
             return AttributionResult(
                 claim=claim,
                 match_type="parse_error",
-                source_chunk=f"Estrattore REBEL ha fallito: {e}",
+                source_chunk=f"Estrattore DeepSeek ha fallito: {e}",
             )
 
         if not triples:
@@ -129,7 +147,7 @@ class ClaimAttributor:
                 claim=claim,
                 match_type="parse_error",
                 source_chunk=(
-                    "REBEL non ha estratto alcuna tripla dal testo. "
+                    "DeepSeek non ha estratto alcuna tripla dal testo. "
                     "Verifica che il claim sia dichiarativo e contenga "
                     "soggetto, predicato e oggetto espliciti."
                 ),

@@ -1,58 +1,101 @@
 """
 Guardrail sulle triple — scarta l'output corrotto prima di JSONL/grafo.
 
-Vale per QUALSIASI produttore (REBEL, DeepSeek, ibrido): una tripla è valida
-solo se è *verificabile sul testo*.  Regole (la prima che fallisce vince):
+Una tripla vale solo se è *verificabile sulla frase sorgente*.  La pipeline
+lavora frase per frase, quindi la frase è nota: `claim_span` non viene più
+chiesto al modello ma assegnato dalla pipeline, e i guardrail verificano la
+tripla CONTRO quella frase.
 
-  1. `no_predicate`        — predicato vuoto o composto solo di stopword
-                             ("is a", "of") → non asserisce nulla.
-  2. `empty_subject` / `empty_object`
-                           — vuoto o senza content token (es. "it", "the").
-  3. `subject_equals_object`
-                           — S e O sono la stessa entità → tautologia.
-  4. `no_span`             — nessuna frase del passaggio contiene sia S sia O:
-                             la tripla non è ancorabile a evidenza verbatim.
-  5. `span_not_verbatim`   — lo span non compare nel testo originale (span
-                             riscritto/allucinato dall'LLM).
-  6. `subject_not_in_span` / `object_not_in_span`
-                           — controllo esplicito sul testo coref-risolto.
-  7. `object_is_claim` / `subject_is_claim`
-                           — S o O copre quasi tutto lo span: l'LLM ha messo
-                             l'intera frase nel campo invece di un'entità.
+Regole, nell'ordine di applicazione (la prima che fallisce vince):
 
-Il match è a livello di token non-stopword (vedi `span_matcher.contains_cue`):
-ordine e articoli diversi passano, parole assenti dal testo no.
+  1. `no_predicate`          predicato vuoto o solo stopword ("is a", "of").
+  2. `unresolved_reference`  S oppure O contiene un riferimento deittico
+                             irrisolto: pronome ("he", "it"), o sintagma
+                             "that same year" / "that game" / "the subsequent
+                             game".  Sono nodi che non identificano nulla
+                             fuori dalla frase — e la coref non li risolve.
+  3. `generic_node`          S oppure O è un sostantivo comune non ancorato
+                             ("game", "teams", "players"): niente entità
+                             nominata (NER), niente PROPN, niente numero/data.
+                             Sono i nodi-calamita che collezionano archi da
+                             fatti diversi: falsi positivi strutturali.
+  4. `empty_subject` / `empty_object`
+                             vuoto o senza content token.
+  5. `subject_equals_object` tautologia.
+  6. `span_not_verbatim`     lo span non compare nel passaggio originale.
+  7. `entity_not_in_sentence`
+                             S oppure O non compare nella frase sorgente
+                             (match normalizzato + fuzzy leggero su morfologia
+                             e possessivi).  Becca le triple inferite da
+                             conoscenza pregressa invece che dal testo.
+  8. `subject_is_claim` / `object_is_claim`
+                             S o O copre quasi tutta la frase: non è
+                             un'entità, è la frase stessa.
+
+Il match lessicale è a livello di content token; il fuzzy tollera plurali,
+possessivi e accenti ("Pelé's" ~ "Pele"), non sinonimi.
 """
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
+import unicodedata
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from functools import lru_cache
+from typing import Optional
 
-from src.ingestion.span_matcher import contains_cue, content_tokens
+from config import settings
+from src.ingestion.span_matcher import content_tokens
 
-# Frazione di content token dello span coperti da S o O oltre la quale il
+logger = logging.getLogger(__name__)
+
+# Frazione di content token della frase coperti da S o O oltre la quale il
 # campo non è più un'entità ma la frase intera.
 CLAIM_COVERAGE = 0.8
-# Sotto questa lunghezza lo span è già corto: la regola 7 non si applica
-# (uno span di 3 token può legittimamente essere quasi tutto l'oggetto).
-CLAIM_MIN_SPAN_TOKENS = 5
+CLAIM_MIN_SENTENCE_TOKENS = 5
+# Soglia di somiglianza per il match fuzzy token-token.
+FUZZY_RATIO = 0.85
+FUZZY_MIN_PREFIX = 4
 
 _WS = re.compile(r"\s+")
+_WORD = re.compile(r"[a-z0-9]+")
 
-# Ordine di applicazione = ordine di dichiarazione; usato anche per la
-# tabella dei motivi di scarto in UI.
 REASONS = (
     "no_predicate",
+    "unresolved_reference",
+    "generic_node",
     "empty_subject",
     "empty_object",
     "subject_equals_object",
-    "no_span",
     "span_not_verbatim",
-    "subject_not_in_span",
-    "object_not_in_span",
+    "entity_not_in_sentence",
     "subject_is_claim",
     "object_is_claim",
+    "duplicate",
+)
+
+# ── Riferimenti deittici irrisolti ───────────────────────────────────
+
+_PRONOUNS = {
+    "he", "him", "his", "she", "her", "hers", "it", "its", "they", "them",
+    "their", "theirs", "this", "that", "these", "those", "we", "us", "our",
+    "you", "your", "i", "me", "my", "who", "whom", "which", "there", "here",
+    "himself", "herself", "itself", "themselves", "one", "another", "other",
+    "others", "someone", "something", "anyone", "anything",
+}
+
+# Determinante deittico in testa al sintagma: "that game", "this season".
+_DEICTIC_HEAD = re.compile(r"^(that|this|these|those|such)\b", re.IGNORECASE)
+# Possessivo in testa: "his team", "their coach".
+_POSSESSIVE_HEAD = re.compile(r"^(his|her|its|their|our|your|my)\b", re.IGNORECASE)
+# "the same year", "the following game", "the aforementioned club".
+_RELATIVE_HEAD = re.compile(
+    r"^(the\s+)?(same|following|previous|subsequent|next|last|later|earlier|"
+    r"former|latter|aforementioned|above|preceding)\b",
+    re.IGNORECASE,
 )
 
 
@@ -61,7 +104,7 @@ class Verdict:
     ok: bool
     reason: str = ""
 
-    def __bool__(self) -> bool:      # `if verdict:` legge come "è valida"
+    def __bool__(self) -> bool:
         return self.ok
 
 
@@ -69,32 +112,170 @@ def _norm_ws(text: str) -> str:
     return _WS.sub(" ", (text or "").strip())
 
 
-def _coverage(field: str, span: str) -> float:
-    span_tok = content_tokens(span)
-    if len(span_tok) < CLAIM_MIN_SPAN_TOKENS:
+def _fold(text: str) -> str:
+    """Minuscolo senza accenti — "Pelé" e "Pele" devono coincidere."""
+    decomposed = unicodedata.normalize("NFKD", (text or "").lower())
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _fuzzy_tokens(text: str) -> set[str]:
+    return set(_WORD.findall(_fold(text)))
+
+
+def _token_matches(token: str, pool: set[str]) -> bool:
+    """Token presente nel pool: esatto, per prefisso comune, o quasi-uguale."""
+    if token in pool:
+        return True
+    for candidate in pool:
+        if len(token) >= FUZZY_MIN_PREFIX and len(candidate) >= FUZZY_MIN_PREFIX:
+            if token.startswith(candidate[:FUZZY_MIN_PREFIX]) or \
+                    candidate.startswith(token[:FUZZY_MIN_PREFIX]):
+                if SequenceMatcher(None, token, candidate).ratio() >= FUZZY_RATIO:
+                    return True
+        elif SequenceMatcher(None, token, candidate).ratio() >= FUZZY_RATIO:
+            return True
+    return False
+
+
+def in_sentence(entity: str, sentence: str) -> bool:
+    """
+    True se ogni content token di `entity` compare nella frase (fuzzy leggero).
+
+    Le stopword sono ignorate: "the 44th president of the United States" si
+    verifica su {44th, president, united, states}.
+    """
+    entity_tokens = {t for t in _fuzzy_tokens(entity) if t not in _STOP_FOLDED}
+    if not entity_tokens:
+        return False
+    pool = _fuzzy_tokens(sentence)
+    return all(_token_matches(tok, pool) for tok in entity_tokens)
+
+
+def is_deictic(entity: str) -> bool:
+    """Riferimento che non identifica nulla fuori dalla frase."""
+    text = _norm_ws(entity)
+    if not text:
+        return False
+    if _fold(text) in _PRONOUNS:
+        return True
+    return bool(
+        _DEICTIC_HEAD.match(text)
+        or _POSSESSIVE_HEAD.match(text)
+        or _RELATIVE_HEAD.match(text)
+    )
+
+
+# ── Ancoraggio dell'entità: NER / POS sulla frase ────────────────────
+
+_HAS_DIGIT = re.compile(r"\d")
+
+
+class EntityAnchorer:
+    """
+    Decide se un'entità è *identificante* nella sua frase.
+
+    Ancorata se: contiene una cifra (anni, punteggi, quantità), oppure si
+    sovrappone a una named entity della frase, oppure almeno un suo token è
+    PROPN / NUM / parte di una entità NER.  Un sostantivo comune nudo
+    ("game", "teams") non lo è.
+    """
+
+    def __init__(self, nlp=None, model: str = settings.SPACY_MODEL):
+        self._nlp = nlp
+        self._model = model
+        # spaCy non e' thread-safe: il runner batch chiama i guardrail da piu'
+        # thread mentre le chiamate LLM sono in volo.
+        self._lock = threading.Lock()
+
+    def _get_nlp(self):
+        if self._nlp is None:
+            import spacy
+            try:
+                self._nlp = spacy.load(self._model)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"modello spaCy '{self._model}' non installato: serve per il "
+                    f"guardrail generic_node ({exc})"
+                ) from exc
+        return self._nlp
+
+    @lru_cache(maxsize=4096)
+    def _analyse(self, sentence: str) -> tuple[frozenset, frozenset]:
+        """`(token ancorati, token di named entity)` della frase, foldati."""
+        with self._lock:
+            doc = self._get_nlp()(sentence)
+        anchored = {
+            _fold(tok.text) for tok in doc
+            if tok.pos_ in ("PROPN", "NUM") or tok.ent_type_
+        }
+        ent_tokens = {
+            _fold(tok.text) for ent in doc.ents for tok in ent
+        }
+        return frozenset(anchored), frozenset(ent_tokens)
+
+    def is_anchored(self, entity: str, sentence: str) -> bool:
+        text = _norm_ws(entity)
+        if not text:
+            return False
+        if _HAS_DIGIT.search(text):
+            return True
+        anchored, ent_tokens = self._analyse(sentence)
+        tokens = {t for t in _fuzzy_tokens(text) if t not in _STOP_FOLDED}
+        if not tokens:
+            return False
+        return any(tok in anchored or tok in ent_tokens for tok in tokens)
+
+
+_DEFAULT_ANCHORER: Optional[EntityAnchorer] = None
+
+
+def default_anchorer() -> EntityAnchorer:
+    """Anchorer condiviso — carica spaCy una volta sola per processo."""
+    global _DEFAULT_ANCHORER
+    if _DEFAULT_ANCHORER is None:
+        _DEFAULT_ANCHORER = EntityAnchorer()
+    return _DEFAULT_ANCHORER
+
+
+# Stopword foldate: stessa lista di span_matcher, in forma senza accenti.
+from src.ingestion.span_matcher import _STOP as _STOP_RAW  # noqa: E402
+
+_STOP_FOLDED = {_fold(w) for w in _STOP_RAW}
+
+
+def _coverage(field: str, sentence: str) -> float:
+    sentence_tokens = content_tokens(sentence)
+    if len(sentence_tokens) < CLAIM_MIN_SENTENCE_TOKENS:
         return 0.0
-    return len(content_tokens(field) & span_tok) / len(span_tok)
+    return len(content_tokens(field) & sentence_tokens) / len(sentence_tokens)
 
 
 def check(
     subject: str,
     predicate: str,
     obj: str,
-    span_original: str | None,
-    span_resolved: str | None = None,
+    sentence: str,
+    claim_span: str = "",
     original_text: str = "",
+    anchorer: Optional[EntityAnchorer] = None,
 ) -> Verdict:
     """
-    Valuta una tripla già ancorata.
+    Valuta una tripla contro la sua frase sorgente.
 
-    `span_original` è l'evidenza verbatim salvata sull'output; `span_resolved`
-    è la stessa finestra sul testo coref-risolto ed è ciò su cui si verifica la
-    presenza di S e O (l'originale può dire "He" dove il modello dice il nome).
+    `sentence` è la frase (coref-risolta) data all'estrattore: è lì che S e O
+    devono comparire.  `claim_span` è la frase corrispondente sul testo
+    ORIGINALE, salvata come evidenza verbatim; se `original_text` è passato si
+    verifica che vi compaia davvero.
     """
-    span_res = span_resolved or span_original or ""
+    anchorer = anchorer or default_anchorer()
 
     if not content_tokens(predicate):
         return Verdict(False, "no_predicate")
+
+    for field in (subject, obj):
+        if is_deictic(field):
+            return Verdict(False, "unresolved_reference")
+
     if not content_tokens(subject):
         return Verdict(False, "empty_subject")
     if not content_tokens(obj):
@@ -102,19 +283,20 @@ def check(
     if content_tokens(subject) == content_tokens(obj):
         return Verdict(False, "subject_equals_object")
 
-    if not (span_original or "").strip():
-        return Verdict(False, "no_span")
-    if original_text and _norm_ws(span_original) not in _norm_ws(original_text):
+    if claim_span and original_text and \
+            _norm_ws(claim_span) not in _norm_ws(original_text):
         return Verdict(False, "span_not_verbatim")
 
-    if not contains_cue(span_res, subject):
-        return Verdict(False, "subject_not_in_span")
-    if not contains_cue(span_res, obj):
-        return Verdict(False, "object_not_in_span")
+    if not in_sentence(subject, sentence) or not in_sentence(obj, sentence):
+        return Verdict(False, "entity_not_in_sentence")
 
-    if _coverage(subject, span_res) >= CLAIM_COVERAGE:
+    for field in (subject, obj):
+        if not anchorer.is_anchored(field, sentence):
+            return Verdict(False, "generic_node")
+
+    if _coverage(subject, sentence) >= CLAIM_COVERAGE:
         return Verdict(False, "subject_is_claim")
-    if _coverage(obj, span_res) >= CLAIM_COVERAGE:
+    if _coverage(obj, sentence) >= CLAIM_COVERAGE:
         return Verdict(False, "object_is_claim")
 
     return Verdict(True)

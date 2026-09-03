@@ -23,6 +23,7 @@ data/*.json
 data/*.csv
 data/processed_ids.txt
 data/outputs/
+data/cache/
 *.bin
 *.pt
 

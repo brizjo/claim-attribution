@@ -2,8 +2,13 @@
 Centralized configuration — Claim Attribution LPG/Neo4j.
 
 Pipeline:
- - Ingestion: ALCE/ASQA passages -> coreference -> triples (REBEL | DeepSeek) -> Neo4j
- - Attribution: claim -> REBEL parse -> exact match / semantic fallback cosine
+ - Ingestion: ALCE/ASQA passages -> coreference -> triples (DeepSeek) -> Neo4j
+ - Attribution: claim -> DeepSeek parse -> exact match / semantic fallback cosine
+
+REBEL e' FUORI dalla pipeline principale (2026-09-03): l'unico estrattore di
+triple e' DeepSeek.  I moduli REBEL restano solo per gli esperimenti
+(`src/ui/experiments.py`, `scripts/run_hybrid_experiment.py`), che esistono
+proprio per misurare quanto REBEL aggiunge.
 
 Corpus is EXCLUSIVELY ALCE: no PDF/TXT loader (removed 2026-08-03).
 """
@@ -73,10 +78,11 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 # CRITICAL: must match the database your Neo4j Browser is connected to.
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
-# -- REBEL — Triple Extraction (English, BART, fast) -----------------------
-# Speed-optimised: rebel-large is ~1.5GB BART encoder-decoder, faster than
-# mrebel-large (mBART ~2GB).  English-only — switch to Babelscape/mrebel-large
-# + REBEL_SRC_LANG="it_IT" if multilingual ingest is required later.
+# -- REBEL — SOLO ESPERIMENTI (fuori dalla pipeline principale) ------------
+# Parametri usati unicamente da `src/ingestion/triple_extractor.py`, che oggi
+# serve la pipeline ibrida degli esperimenti (varianti A/D) e non l'ingestione.
+# English-only — switch to Babelscape/mrebel-large + REBEL_SRC_LANG="it_IT"
+# if multilingual extraction is required later.
 REBEL_MODEL = "Babelscape/rebel-large"
 REBEL_SRC_LANG = None            # only used when model name contains "mrebel"
 REBEL_MAX_LENGTH = 256           # max new tokens generated
@@ -86,10 +92,13 @@ REBEL_BATCH_SIZE = 16            # batched forward; tune to GPU/CPU memory
 # Each edge in Neo4j carries an `extractor` property: graphs from different
 # extractors coexist without mixing (filter on MERGE, idempotency,
 # and in ALL attribution queries).
+# `EXTRACTOR_REBEL` resta come ETICHETTA: identifica gli archi scritti dai
+# grafi vecchi, che restano interrogabili. Non e' piu' un estrattore
+# selezionabile: la pipeline principale ha un solo estrattore, DeepSeek.
 EXTRACTOR_REBEL = "rebel"
 EXTRACTOR_DEEPSEEK = "deepseek"
-AVAILABLE_EXTRACTORS = [EXTRACTOR_REBEL, EXTRACTOR_DEEPSEEK]
-ACTIVE_EXTRACTOR = os.getenv("ACTIVE_EXTRACTOR", EXTRACTOR_REBEL)
+AVAILABLE_EXTRACTORS = [EXTRACTOR_DEEPSEEK]
+ACTIVE_EXTRACTOR = os.getenv("ACTIVE_EXTRACTOR", EXTRACTOR_DEEPSEEK)
 
 # -- DeepSeek (LLM extractor, OpenAI-compatible API) -----------------------
 # API key: put it in `.env` in the project root (already in .gitignore):
@@ -102,6 +111,14 @@ DEEPSEEK_TEMPERATURE = 0.0       # ALWAYS 0: deterministic extraction, never cre
 DEEPSEEK_MAX_TOKENS = 1500
 DEEPSEEK_TIMEOUT = 120           # seconds per request
 DEEPSEEK_MAX_RETRIES = 3
+
+# -- Cache risposte LLM (riproducibilita' degli esperimenti) ---------------
+# temperature=0 NON garantisce determinismo lato API: due run sullo stesso
+# prompt hanno dato conteggi di triple diversi. La cache su disco, indicizzata
+# per hash del prompt, rende un ri-run identico al precedente (e gratuito).
+# LLM_CACHE=0 nell'ambiente la disattiva (per forzare chiamate fresche).
+LLM_CACHE_ENABLED = os.getenv("LLM_CACHE", "1") not in ("0", "false", "False")
+LLM_CACHE_DIR = str(PROJECT_ROOT / "data" / "cache" / "llm")
 
 # -- ALCE/ASQA corpus (sole ingestion source) ------------------------------
 ALCE_DATA_PATH = os.getenv(
@@ -123,6 +140,38 @@ OUTPUT_DIR = str(PROJECT_ROOT / "data" / "outputs")
 PREDICATE_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SEMANTIC_THRESHOLD = 0.75       # cosine similarity threshold for fallback match
 ENTITY_CLUSTER_THRESHOLD = 0.90 # cosine similarity threshold for entity clustering
+
+# -- Canonicalizzazione delle entita' (fase fra extract e write) ------------
+# Terza fase della pipeline: le triple di una domanda sono tutte in memoria e
+# nessuna e' ancora scritta -> e' il momento giusto per unificare i nodi.
+# Lo scope e' un parametro perche' e' ablabile in tesi:
+#   per_passage  — troppo stretto: la stessa entita' in 3 passaggi resta 3 nodi
+#   per_question — default: unifica dentro la domanda (le sue 5 evidenze)
+#   global       — troppo largo: collassa omonimi ("Louise") di domande diverse
+CANON_SCOPE_PASSAGE = "per_passage"
+CANON_SCOPE_QUESTION = "per_question"
+CANON_SCOPE_GLOBAL = "global"
+CANONICALIZATION_SCOPES = [
+    CANON_SCOPE_PASSAGE, CANON_SCOPE_QUESTION, CANON_SCOPE_GLOBAL,
+]
+CANONICALIZATION_SCOPE = os.getenv("CANONICALIZATION_SCOPE", CANON_SCOPE_QUESTION)
+# Stadio 2 (lessicale): soglia difflib per refusi/varianti. Il contenimento di
+# token e le abbreviazioni con iniziale sono regole esatte, non usano la soglia.
+CANONICALIZATION_LEXICAL_THRESHOLD = 0.90
+# Stadio 3 (entity linking): "title" usa il campo `title` del passaggio ALCE
+# (titolo Wikipedia, gratuito e offline); "spotlight" aggiunge DBpedia
+# Spotlight (rete, degrada allo stadio 4 se non risponde); "none" lo disattiva.
+ENTITY_LINKER = os.getenv("ENTITY_LINKER", "title")
+DBPEDIA_SPOTLIGHT_URL = os.getenv(
+    "DBPEDIA_SPOTLIGHT_URL", "https://api.dbpedia-spotlight.org/en/annotate"
+)
+DBPEDIA_SPOTLIGHT_CONFIDENCE = 0.5
+DBPEDIA_SPOTLIGHT_TIMEOUT = 10   # secondi
+
+# -- UI: tab esperimenti ---------------------------------------------------
+# Gli esperimenti (pipeline ibrida A/D, cache LLM, run batch) sono strumenti di
+# sviluppo, non funzionalita' del sistema: nascosti se non richiesti.
+SHOW_EXPERIMENTS = os.getenv("SHOW_EXPERIMENTS", "0") not in ("", "0", "false", "False")
 
 # -- spaCy (coreference resolution) ----------------------------------------
 SPACY_MODEL = "en_core_web_lg"  # Used by CoreferenceResolver (coreferee requires lg)

@@ -158,3 +158,151 @@
 - Guardrail: predicato senza content token ("is a") = nessuna asserzione, si
   scarta. Stessa regola per subject/object composti solo da stopword ("it"):
   senza content token la tripla non e' ancorabile a nessuno span.
+
+## Fase 16 — Fix pipeline ibrida + esperimento A/D (2026-09-02)
+
+- **Lo span non si chiede al modello: lo sa gia' la pipeline.** Chiedere
+  `claim_span` nel JSON produceva 38 span vuoti su 153 e altrettante triple
+  valide scartate. Lavorando frase per frase la sorgente e' nota: si assegna
+  `claim_span` = frase ORIGINALE allineata a quella coref-risolta data
+  all'estrattore (`span_matcher.align_sentences`). Dopo il fix: 870 triple
+  salvate, 0 span vuoti, 0 span non verbatim, motivo `no_span` sparito.
+- **I nodi generici sono il vero generatore di falsi positivi.** Non serve una
+  regola sul testo ma su cosa il nodo *identifica*: NER/POS della frase, e se
+  l'entita' non tocca ne' una named entity ne' un PROPN ne' un numero/data ->
+  `generic_node`. E' il guardrail che scarta di piu' (65 triple in A, 93 in D):
+  il nodo "game" che collezionava 14 archi da partite diverse non nasce piu'.
+- **Un "keep" del validatore non e' una conferma.** Se poi i guardrail uccidono
+  la tripla, il candidato REBEL va contato fra le rigettate. Prima veniva
+  marcato `validated` e saltato in fase di riconciliazione: i totali non
+  quadravano (`matched + rejected != prodotte`). Regola: ogni candidato riceve
+  uno e un solo stato, assegnato per indice alla fine, e nessuno stato
+  intermedio salta la riconciliazione finale.
+- **temperature=0 non e' riproducibilita'.** Due run identici davano 14 e 16
+  triple. La cache su disco in `DeepSeekClient` (SHA256 di modello +
+  temperatura + max_tokens + messaggi, log HIT/MISS, `cache_stats()`) rende il
+  ri-run identico e gratuito. Attenzione: in variante A il vocabolario REBEL fa
+  parte del prompt, quindi cambiare l'insieme di domande cambia i prompt e
+  invalida la cache — e' corretto, ma va saputo.
+- **`rebel-large` non ha un `id2label` utile.** E' un BART seq2seq: il config
+  espone `LABEL_0/1/2`. Il "vocabolario REBEL" si ricava dall'output del
+  modello sul corpus (117 predicati distinti su 50 passaggi): e' il vocabolario
+  che REBEL usa davvero, non quello che dichiara.
+- **fastcoref NON era rotto in questo ambiente** (transformers 4.55.4, pin
+  `<4.56` gia' presente): `check()` risolve "He" -> "Barack Obama". I 10
+  riferimenti deittici nei dati non venivano da un coref saltato ma da un suo
+  limite: risolve le catene di menzioni, non "that same year" / "the subsequent
+  game". Quelli li prende il guardrail `unresolved_reference`. Il resolver ora
+  solleva comunque `CorefUnavailable` invece di degradare in silenzio, e il
+  runner esce con codice 2.
+- **Il tasso di conferma aggregato e' una media che mente.** Su D: 27.5%
+  complessivo, ma `participating team` 67%, `location` 59%, `inception` 54%
+  contro `subclass of` 0%, `sport` 0%, `instance of` 4%. La decisione su REBEL
+  va presa per relazione, non sul totale.
+- **Dare a DeepSeek il vocabolario di REBEL peggiora la resa** (variante A: 308
+  triple finali contro 562 di D, 320 triple presenti solo in D). Il vocabolario
+  chiuso ancora l'estrazione a relazioni Wikidata-style e fa perdere fatti che
+  la frase dice esplicitamente.
+- **Una cache concorrente senza single-flight non basta a rendere un run
+  riproducibile.** Ri-eseguito lo stesso esperimento a cache calda: 584 hit / 0
+  miss (quindi prompt identici e risposte identiche), eppure la variante D
+  dava 772 triple invece di 770. Causa: nel primo run 6 thread lavoravano in
+  parallelo e alcune frasi identiche comparivano in passaggi diversi — due
+  thread mancavano la cache sullo STESSO prompt, chiamavano entrambi l'API e
+  ricevevano risposte diverse (l'API non e' deterministica nemmeno a
+  temperature=0). La cache conservava poi solo l'ultima scritta, quindi il
+  secondo run vedeva una risposta sola. Fix: single-flight in `DeepSeekClient`
+  (`_claim_key`/`_release_key`): il primo thread chiama, gli altri con la
+  stessa chiave aspettano e leggono dalla cache. Test dedicato in
+  `tests/test_llm_cache.py`. *Lezione: in un esperimento parallelo la cache va
+  progettata come "una chiamata per chiave", non come "scrivi quando hai
+  finito" — altrimenti la nondeterminicita' dell'API rientra dalla finestra.*
+
+## Canonicalizzazione delle entita' (2026-09-03)
+
+- **Il posto giusto per unificare i nodi e' PRIMA della scrittura.** Durante
+  l'estrazione il modello vede una frase alla volta e non puo' sapere che
+  "VanDeWeghe" e' "Kiki VanDeWeghe"; dopo la scrittura, unire nodi gia' in
+  Neo4j (`merge_entity_into_canonical`) significa riattaccare archi a mano e
+  perdere proprieta'. La pipeline ha ora tre fasi: `extract_entry` ->
+  `canonicalize_entry` -> `write_entry`, con `write_entry` ridotto a I/O.
+- **Lo scope della canonicalizzazione e' una scelta con un costo, quindi e' un
+  parametro.** `per_passage` e' troppo stretto (`Josef Bican` in 3 passaggi
+  della stessa domanda resterebbe 3 nodi: recall persa in attribution);
+  `global` e' troppo largo (`Louise`, 19 archi su 5 passaggi, collassa persone
+  diverse) e in piu' regala recall usando evidenza fuori dallo scope della
+  domanda — **se si usa `global` va dichiarato come limite in tesi**. Default
+  `per_question`: la domanda ALCE con i suoi 5 passaggi.
+- **Il genitivo sassone si riduce al possessore, non si scarta.**
+  `Wilt Chamberlain's set` e `Campbell's call` non sono entita', ma
+  `Wilt Chamberlain` e `Campbell` lo sono: scartare la menzione butterebbe via
+  l'arco insieme al rumore. La riduzione scatta solo se dopo `'s` c'e' un altro
+  token — cosi' `Levi's` e `McDonald's`, dove l'apostrofo fa parte del nome,
+  restano intatti.
+- **Lo strip dell'articolo iniziale ha un costo noto e accettato.**
+  `The Sound of Silence` -> `Sound of Silence`: la normalizzazione e' applicata
+  a TUTTE le menzioni, quindi le forme con e senza articolo si unificano invece
+  di restare due nodi. Il prezzo e' che il titolo perde il suo articolo: la
+  forma verbatim resta comunque su `surface_form`.
+- **`title` del passaggio ALCE e' entity linking gratuito.** E' il titolo
+  dell'articolo Wikipedia da cui il passaggio e' preso: aggancia l'entita'
+  principale senza rete, senza soglia e senza ambiguita' quando un solo titolo
+  dello scope contiene la menzione (se ne combaciano due — "Louise" fra
+  "Louise Brown" e "Louise Smith" — non si aggancia niente e si lascia decidere
+  allo stadio 4). Da' anche il NOME canonico: meglio il titolo Wikipedia della
+  menzione piu' lunga vista nel testo.
+- **Alternative di linking valutate.** *DBpedia Spotlight*: implementato come
+  linker opzionale (`ENTITY_LINKER=spotlight`) perche' e' un servizio HTTP
+  senza installazione, ma e' rete a ogni menzione e il servizio pubblico e'
+  spesso lento — resta OPT-IN e degrada esplicitamente (log + stadio 4), mai in
+  silenzio (precedente: fastcoref). *spaCy `entityLinker`*: richiede il
+  download di un KB (~1.5GB) e un modello aggiuntivo, sproporzionato per un
+  segnale che il campo `title` gia' copre. *Wikipedia search API*: una query
+  per menzione, e sui nomi comuni restituisce il risultato piu' popolare, cioe'
+  esattamente il falso merge che si vuole evitare. Scelta: `title` come
+  default.
+- **Il tie-break alfabetico sceglie il refuso.** Con `max(..., key=(len, form))`
+  fra `Cristiano Ronaldo` e `Cristiano Ronalod` (stessa lunghezza) vince
+  l'errore, perche' 'o' > 'd'. La forma canonica ora si sceglie per
+  `(lunghezza, frequenza, prima occorrenza)`: mai per ordine alfabetico.
+- **Il log e' per OCCORRENZA, non per forma.** Una riga per menzione con il suo
+  `source_id`: senza questo non si puo' contare quanti archi ha un nodo e su
+  quanti passaggi distinti, che e' il segnale per trovare i falsi merge
+  (`scripts/analyze_canonicalization.py`). Se la maggioranza delle menzioni si
+  chiude agli stadi 1-3, la canonicalizzazione e' in gran parte deterministica:
+  e' la frase da scrivere in tesi, ma va misurata, non assunta.
+- **Gli esperimenti non sono funzionalita'.** Il tab ibrido A/D e' uscito da
+  `app.py` (1114 -> 754 righe) ed e' in `src/ui/experiments.py`, visibile solo
+  con `SHOW_EXPERIMENTS=1`. Le risorse Streamlit condivise stanno in
+  `src/ui/resources.py`: due `@st.cache_resource` con lo stesso corpo ma in
+  moduli diversi sono due cache diverse, cioe' REBEL caricato due volte.
+
+## REBEL fuori dalla pipeline principale (2026-09-03)
+
+- **Decisione presa sui numeri, non a sensazione.** L'esperimento ibrido esisteva
+  per rispondere a "REBEL serve?". Risposta sui 50 passaggi / 267 frasi: REBEL
+  conferma l'11.1% delle triple in variante A e il 27.5% in D; dare a DeepSeek
+  il vocabolario chiuso di REBEL **peggiora** la resa (308 triple finali contro
+  562, con fatti espliciti persi come `Josef Bican | birth date | 25 Sept 1913`);
+  costo ~20s per passaggio su CPU. Estrattore unico: DeepSeek.
+- **Togliere un estrattore non e' cancellare un modulo.** `Triple` (la
+  NamedTuple usata da TUTTO il sistema) vive in `triple_extractor.py` insieme a
+  `TripleExtractor` (REBEL): il modulo resta. Quel che cambia e' chi lo
+  costruisce — `build_extractor` non lo istanzia piu' e alza un ValueError che
+  indirizza agli esperimenti, invece di sparire e lasciare un `KeyError` oscuro.
+- **La simmetria di estrazione va spostata insieme all'estrattore.**
+  `ClaimAttributor` parsava il claim con `TripleExtractor()`: lasciarlo li'
+  avrebbe verificato claim estratti da REBEL contro un grafo scritto da
+  DeepSeek — vocabolari diversi, cioe' il requisito §4 rotto in silenzio. Ora
+  parsa con `DeepSeekExtractor`, con un test che lo blocca
+  (`tests/test_pipeline_extractor.py`).
+- **`DeepSeekExtractor.extract` logga e salta i chunk falliti.** Nel percorso di
+  attribution quel comportamento traduceva "API key mancante" in "nessuna
+  tripla estratta dal claim": un fallimento silenzioso travestito da risultato.
+  Aggiunto un check `is_available()` a monte con messaggio esplicito.
+- **`ACTIVE_EXTRACTOR` e' un filtro sul grafo, non solo una scelta di modello.**
+  Restava `rebel` nel `.env` locale: la pipeline avrebbe scritto archi
+  `deepseek` e l'attribution avrebbe interrogato solo quelli `rebel` — grafo
+  pieno e zero risultati. Cambiato in `deepseek` in `.env` e `.env.example`.
+  L'etichetta `EXTRACTOR_REBEL` resta in settings: i grafi vecchi restano
+  interrogabili puntando `ACTIVE_EXTRACTOR=rebel` di proposito.

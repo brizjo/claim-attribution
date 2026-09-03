@@ -11,6 +11,8 @@ Produced files (under settings.OUTPUT_DIR):
     triples_extracted.jsonl     each (S, P, O) + claim_span + source_id
     attribution_results.jsonl   claim attribution outcomes
     ingest_reports.jsonl        per-question ingestion summaries
+    canonicalization.jsonl      una riga per menzione: forma originale -> forma
+                                canonica, stadio (1-4), confidenza, external_id
 
 Pipeline ibrida REBEL+DeepSeek (nessun campo `extractor`: la pipeline è una
 sola, `origin` dice solo quale modello ha proposto la tripla):
@@ -179,6 +181,27 @@ def save_ingest_report(
     })
 
 
+# ── Canonicalizzazione delle entita' (fase pre-write) ─────────────────
+
+
+def save_canonicalization(records: list[dict]) -> int:
+    """
+    Persiste l'esito della cascata di canonicalizzazione: una riga per
+    menzione.  E' il deliverable dell'analisi (quante menzioni si chiudono a
+    ciascuno stadio), non un log accessorio — vedi
+    `scripts/analyze_canonicalization.py`.
+    """
+    if not records:
+        return 0
+    path = _BASE / "canonicalization.jsonl"
+    _ensure_dir(path)
+    ts = _timestamp()
+    with path.open("a", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps({**record, "timestamp": ts}, ensure_ascii=False) + "\n")
+    return len(records)
+
+
 # ── Pipeline ibrida (REBEL + DeepSeek) ────────────────────────────────
 
 
@@ -192,12 +215,15 @@ def _hybrid_record(
         "source_id": passage.source_id,
         "title": passage.title,
         "chunk_index": passage.chunk_index,
+        "sentence_index": t.sentence_index,
         "subject": t.subject,
         "predicate": t.predicate,
         "object": t.obj,
         "claim_span": t.claim_span,
+        "sentence": t.sentence,
         "chunk_text": passage.original_text,
         "origin": t.origin,
+        "rebel_predicate": t.rebel_predicate,
         "timestamp": ts,
     }
     if with_reason:
@@ -244,6 +270,7 @@ def save_hybrid_report(report) -> dict[str, int]:
         "rebel_produced": report.rebel_produced,
         "rebel_matched": report.rebel_matched,
         "rebel_kept": report.rebel_kept,
+        "vocabulary_size": len(report.vocabulary),
         "rebel_rejected": report.rebel_rejected,
         "discard_reasons": dict(report.discard_reasons),
         "llm_calls": report.llm_calls,

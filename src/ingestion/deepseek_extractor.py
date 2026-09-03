@@ -1,7 +1,8 @@
 """
-DeepSeek triple extractor — controparte LLM di REBEL.
+DeepSeek triple extractor — UNICO estrattore della pipeline (2026-09-03).
 
-Stessa interfaccia di `TripleExtractor`:
+Interfaccia (la stessa che implementa anche `TripleExtractor`, oggi confinato
+agli esperimenti):
     .name                          → "deepseek"
     .extract(chunks) -> list[Triple]
 

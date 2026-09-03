@@ -15,16 +15,25 @@ class Neo4jClient:
     Wraps the neo4j driver.
 
     Schema:
-        (:Entity {name, normalized_name})
+        (:Entity {name, normalized_name, external_id})
         -[:RELATES_TO {predicate, chunk_text, claim_span, source_file,
                         source_id, extractor, chunk_index,
-                        predicate_embedding}]->
+                        predicate_embedding,
+                        subject_surface, object_surface}]->
+
+      * `name` / `normalized_name` = forma CANONICA (vedi
+        `src/ingestion/entity_canonicalizer.py`);
+      * `subject_surface` / `object_surface` = menzione verbatim nel testo:
+        la provenienza non deve mai essere riscritta dalla canonicalizzazione;
+      * `external_id` = ID esterno agganciato dallo stadio 3 (entity linking).
 
     Chiave logica dell'arco: (predicate, source_id, extractor).
       * `source_id`  = doc["id"] ALCE → la stessa relazione vista in due
         passaggi diversi resta come due archi distinti (due prove).
-      * `extractor`  = "rebel" | "deepseek" → i grafi dei due estrattori
-        coesistono senza mescolarsi; il filtro va applicato OVUNQUE.
+      * `extractor`  = "deepseek" per tutto il grafo corrente ("rebel" solo
+        negli archi scritti prima del 2026-09-03, quando REBEL e' uscito dalla
+        pipeline): i due grafi coesistono senza mescolarsi e il filtro va
+        applicato OVUNQUE.
     Tutte le scritture usano MERGE (mai CREATE): la re-ingestione dello
     stesso documento non duplica archi.
     """
@@ -88,8 +97,12 @@ class Neo4jClient:
     _MERGE_TRIPLE = """
     MERGE (sub:Entity {normalized_name: $s_norm})
       ON CREATE SET sub.name = $s_name
+    SET sub.external_id = CASE WHEN $s_ext <> ''
+                          THEN $s_ext ELSE sub.external_id END
     MERGE (obj:Entity {normalized_name: $o_norm})
       ON CREATE SET obj.name = $o_name
+    SET obj.external_id = CASE WHEN $o_ext <> ''
+                          THEN $o_ext ELSE obj.external_id END
     MERGE (sub)-[r:RELATES_TO {
         predicate: $pred,
         source_id: $source_id,
@@ -99,7 +112,9 @@ class Neo4jClient:
         r.claim_span = $claim_span,
         r.source_file = $source_file,
         r.chunk_index = $chunk_index,
-        r.predicate_embedding = $pred_emb
+        r.predicate_embedding = $pred_emb,
+        r.subject_surface = $s_surface,
+        r.object_surface = $o_surface
     """
 
     @staticmethod
@@ -117,6 +132,11 @@ class Neo4jClient:
             "extractor": t.get("extractor", ""),
             "chunk_index": t.get("chunk_index", 0),
             "pred_emb": t["predicate_embedding"],
+            # Canonicalizzazione: menzione verbatim sull'arco, ID esterno sul nodo.
+            "s_surface": t.get("subject_surface", t["subject"]),
+            "o_surface": t.get("object_surface", t["obj"]),
+            "s_ext": t.get("subject_external_id", "") or "",
+            "o_ext": t.get("object_external_id", "") or "",
         }
 
     def batch_write_triples(
@@ -314,7 +334,16 @@ class Neo4jClient:
         duplicate_normalized: str,
         canonical_name: str,
     ) -> None:
-        """Merge a duplicate entity into the canonical entity, preserving all relationships."""
+        """
+        LEGACY (dal 2026-09-03).  Unire nodi GIA' scritti e' fragile e perde
+        proprieta': la canonicalizzazione avviene ora PRIMA della scrittura, in
+        `src/ingestion/entity_canonicalizer.py`.  Questo metodo resta solo per
+        `EntityClusterer` (post-hoc) e per i grafi vecchi; non usarlo in
+        pipeline nuove.
+
+        Merge a duplicate entity into the canonical entity, preserving all
+        relationships.
+        """
         with self._session() as s:
             with s.begin_transaction() as tx:
                 # Ensure canonical node exists

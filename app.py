@@ -5,13 +5,17 @@ Tab 1 -- Corpus ALCE: 6-step pipeline
     Step 1: Choose ASQA question
     Step 2: Show passages
     Step 3: Coreference resolution
-    Step 4: Extract triples (REBEL / DeepSeek)
+    Step 4: Extract triples (DeepSeek)
     Step 5: Review all triples
-    Step 6: Write to Neo4j
+    Step 6: Canonicalize entities (4-stage cascade) + write to Neo4j
 
 Tab 2 -- Claim Attribution: input claim -> exact match / semantic fallback -> source
 
+Tab esperimenti (pipeline ibrida REBEL+DeepSeek, tabelle A/D, cache LLM):
+`src/ui/experiments.py`, visibile SOLO con `SHOW_EXPERIMENTS=1` nell'ambiente.
+
 Run: streamlit run app.py
+     SHOW_EXPERIMENTS=1 streamlit run app.py    # con il tab esperimenti
 """
 
 import os
@@ -89,89 +93,20 @@ st.markdown("""
 
 
 # ====================================================================
-# Cached resources
+# Cached resources — definite in src/ui/resources.py: un
+# @st.cache_resource duplicato caricherebbe i modelli due volte.
 # ====================================================================
 
-@st.cache_resource
-def get_neo4j_client():
-    try:
-        from src.graph.neo4j_client import Neo4jClient
-        return Neo4jClient()
-    except Exception:
-        return None
-
-
-@st.cache_resource
-def get_alce_loader():
-    """ALCE corpus loaded once per session (~10MB)."""
-    from src.ingestion.alce_loader import AlceLoader
-    return AlceLoader()
-
-
-@st.cache_resource
-def get_ingestor(extractor_name: str):
-    """One ingestor per extractor — keeps REBEL model loaded."""
-    from src.ingestion.alce_ingestor import AlceIngestor, build_extractor
-    return AlceIngestor(
-        client=get_neo4j_client(),
-        extractor=build_extractor(extractor_name),
-    )
-
-
-@st.cache_resource
-def get_deepseek():
-    from src.ingestion.deepseek_extractor import DeepSeekExtractor
-    return DeepSeekExtractor()
-
-
-@st.cache_resource
-def get_debug_rebel_extractor():
-    """Standalone REBEL — no Neo4j dependency, for debug/timing."""
-    from src.ingestion.triple_extractor import TripleExtractor
-    return TripleExtractor()
-
-
-@st.cache_resource
-def get_debug_coref_resolver():
-    from src.ingestion.coref_resolver import CoreferenceResolver
-    return CoreferenceResolver()
-
-
-@st.cache_resource
-def get_sentence_splitter():
-    """spaCy sentence splitter — usato dalla pipeline ibrida (REBEL per frase)."""
-    from src.segmentation.sentence_splitter import SentenceSplitter
-    return SentenceSplitter()
-
-
-@st.cache_resource
-def get_hybrid_extractor(variant: str):
-    """Un HybridExtractor per variante — riusa REBEL/DeepSeek/spaCy gia' caricati."""
-    from src.ingestion.hybrid_extractor import HybridExtractor
-    return HybridExtractor(
-        rebel=get_debug_rebel_extractor(),
-        deepseek_client=get_deepseek().client,
-        splitter=get_sentence_splitter(),
-        variant=variant,
-    )
-
-
-@st.cache_resource
-def get_graph_writer():
-    """One GraphWriter — keeps its SentenceTransformer loaded across writes."""
-    from src.ingestion.graph_writer import GraphWriter
-    return GraphWriter(client=get_neo4j_client())
-
-
-@st.cache_resource
-def get_attributor(semantic_threshold: float, extractor: str):
-    """One ClaimAttributor per (threshold, extractor) — keeps REBEL + encoder loaded."""
-    from src.attribution.claim_attributor import ClaimAttributor
-    return ClaimAttributor(
-        client=get_neo4j_client(),
-        semantic_threshold=semantic_threshold,
-        extractor=extractor,
-    )
+from src.ui.resources import (
+    get_alce_loader,
+    get_attributor,
+    get_canonicalizer,
+    get_debug_coref_resolver,
+    get_deepseek,
+    get_graph_writer,
+    get_ingestor,
+    get_neo4j_client,
+)
 
 
 # ====================================================================
@@ -271,9 +206,15 @@ with st.sidebar:
 # Tabs
 # ====================================================================
 
-tab_ingest, tab_hybrid, tab_claim = st.tabs(
-    ["Corpus ALCE", "Hybrid Debug (REBEL + DeepSeek)", "Claim Attribution"]
-)
+# Il tab degli esperimenti compare solo con SHOW_EXPERIMENTS=1: sono strumenti
+# di sviluppo, non funzionalita' del sistema (vedi src/ui/experiments.py).
+if settings.SHOW_EXPERIMENTS:
+    tab_ingest, tab_experiments, tab_claim = st.tabs(
+        ["Corpus ALCE", "Esperimenti (REBEL + DeepSeek)", "Claim Attribution"]
+    )
+else:
+    tab_experiments = None
+    tab_ingest, tab_claim = st.tabs(["Corpus ALCE", "Claim Attribution"])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -309,7 +250,7 @@ def _render_ingest_tab() -> None:
         "Sole data source. Each question has 5 passages "
         "(oracle-reranked, ~100 words each = native chunks). "
         "Pipeline: original text -> coref -> triple extraction "
-        "(<strong>REBEL</strong> and/or <strong>DeepSeek</strong>) -> Neo4j, "
+        "(<strong>DeepSeek</strong>) -> canonicalization -> Neo4j, "
         "with <code>source_id</code> = <code>doc[\"id\"]</code> as provenance."
         "</p>",
         unsafe_allow_html=True,
@@ -332,24 +273,19 @@ def _render_ingest_tab() -> None:
     # ================================================================
     st.markdown('<div class="step-header">Step 1 -- Choose Question</div>', unsafe_allow_html=True)
 
-    col_ext, col_search = st.columns([1, 2])
-    with col_ext:
-        active_extractor = st.radio(
-            "Extractor",
-            options=settings.AVAILABLE_EXTRACTORS,
-            index=0,
-            horizontal=True,
-            help="Select which extractor to use for triple extraction.",
-        )
-    with col_search:
-        search_q = st.text_input(
-            "Filter questions",
-            placeholder="e.g. 'world cup', 'president', 'album'...",
-        )
+    # Un solo estrattore nella pipeline: DeepSeek. REBEL vive solo negli
+    # esperimenti (SHOW_EXPERIMENTS=1).
+    active_extractor = settings.EXTRACTOR_DEEPSEEK
 
-    if active_extractor == settings.EXTRACTOR_DEEPSEEK and not get_deepseek().is_available():
+    search_q = st.text_input(
+        "Filter questions",
+        placeholder="e.g. 'world cup', 'president', 'album'...",
+    )
+    st.caption(f"Extractor: `{active_extractor}` -- unico estrattore della pipeline.")
+
+    if not get_deepseek().is_available():
         st.warning(
-            "DeepSeek selected but `DEEPSEEK_API_KEY` is not configured -- "
+            "`DEEPSEEK_API_KEY` is not configured -- "
             "create `.env` in project root (see `.env.example`)."
         )
 
@@ -441,7 +377,7 @@ def _render_ingest_tab() -> None:
         from src.ingestion.span_matcher import best_span
         from src.ingestion.output_store import save_coref
 
-        extractor_obj = get_debug_rebel_extractor() if active_extractor == settings.EXTRACTOR_REBEL else get_deepseek()
+        extractor_obj = get_deepseek()
         resolver = get_debug_coref_resolver()
         results = []
 
@@ -561,7 +497,7 @@ def _render_ingest_tab() -> None:
     # ================================================================
     # STEP 6 — Write to Neo4j
     # ================================================================
-    st.markdown('<div class="step-header">Step 6 -- Write to Neo4j</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-header">Step 6 -- Canonicalize + Write to Neo4j</div>', unsafe_allow_html=True)
 
     col_w, col_f, col_c = st.columns([2, 1, 1])
     with col_w:
@@ -589,6 +525,7 @@ def _render_ingest_tab() -> None:
         st.rerun()
 
     if write_btn and neo4j and extract_data:
+        from src.ingestion.alce_ingestor import DocResult, IngestReport
         from src.ingestion.processed_registry import ProcessedRegistry
         from src.ingestion.output_store import save_ingest_report
 
@@ -598,10 +535,39 @@ def _render_ingest_tab() -> None:
         total_written = 0
         errors = []
 
+        # Fase intermedia: canonicalizzazione. Il write riceve triple con i nodi
+        # gia' unificati e `predicate_embedding` gia' calcolato -- e' l'ultimo
+        # momento in cui tutte le triple della domanda sono ancora in memoria.
+        report = IngestReport(
+            extractor=ext_name,
+            sample_id=selected.sample_id,
+            question=selected.question,
+            docs=[
+                DocResult(
+                    source_id=r["source_id"],
+                    title=r["title"],
+                    chunk_index=r["chunk_index"],
+                    original_text=r["original_text"],
+                    sample_id=selected.sample_id,
+                    resolved_text=r["resolved_text"],
+                    triples=r["triples"],
+                )
+                for r in extract_data["results"]
+            ],
+        )
+
         with st.status(f"Writing triples to Neo4j ({ext_name})...", expanded=True) as stage:
-            for r in extract_data["results"]:
-                sid = r["source_id"]
-                triples = r["triples"]
+            stage.update(label="Canonicalizzazione delle entita'...")
+            try:
+                canonicalization = get_canonicalizer().canonicalize(report).summary()
+            except Exception as exc:
+                canonicalization = {}
+                errors.append(f"canonicalizzazione: {exc}")
+                stage.update(label=f"Canonicalizzazione fallita: {exc}", state="error")
+
+            for doc in report.docs:
+                sid = doc.source_id
+                triples = doc.triples
 
                 if force_write:
                     neo4j.delete_by_source(sid, ext_name)
@@ -622,6 +588,19 @@ def _render_ingest_tab() -> None:
             stage.update(
                 label=f"Done: {total_written} triples written to Neo4j ({ext_name})",
                 state="error" if errors else "complete",
+            )
+
+        if canonicalization:
+            st.caption(
+                f"Canonicalizzazione (`{canonicalization['scope']}`): "
+                f"{canonicalization['nodes_before']} -> "
+                f"{canonicalization['nodes_after']} nodi, "
+                f"{canonicalization['merged']} menzioni fuse | stadi: "
+                f"1 {canonicalization['stage_1_pct']}% - "
+                f"2 {canonicalization['stage_2_pct']}% - "
+                f"3 {canonicalization['stage_3_pct']}% - "
+                f"4 {canonicalization['stage_4_pct']}% "
+                "(dettaglio in `data/outputs/canonicalization.jsonl`)"
             )
 
         # Save ingest report to JSONL
@@ -657,272 +636,18 @@ with tab_ingest:
     _render_ingest_tab()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# TAB 2 — HYBRID DEBUG (REBEL + DeepSeek, varianti A / B)
-# ──────────────────────────────────────────────────────────────────────
+if tab_experiments is not None:
+    from src.ui import experiments
 
-def _triple_line(subject: str, predicate: str, obj: str, extra: str = "") -> None:
-    st.markdown(
-        f'<span class="triple-tag">S: {subject}</span> '
-        f'<span class="triple-tag">P: {predicate}</span> '
-        f'<span class="triple-tag">O: {obj}</span>'
-        + (f' <span class="span-label">{extra}</span>' if extra else ""),
-        unsafe_allow_html=True,
-    )
+    with tab_experiments:
+        experiments.render()
 
 
-def _passage_rows(report) -> list[dict]:
-    """Righe della tabella di debug: una per passaggio + totali."""
-    rows = []
-    for p in report.passages:
-        rows.append({
-            "passage": f"[{p.chunk_index}] {p.source_id}",
-            "triple prodotte": p.produced,
-            "sopravvissute": len(p.survived),
-            "scartate (guardrail)": len(p.discarded),
-            "REBEL prodotte": len(p.rebel_raw),
-            "REBEL confermate": p.rebel_matched,
-            "REBEL rigettate": len(p.rebel_rejected),
-            "triple finali da REBEL": p.rebel_kept,
-            "LLM calls": p.llm_calls,
-            "sec": round(p.rebel_seconds + p.llm_seconds, 2),
-        })
-    rows.append({
-        "passage": "TOTALE",
-        "triple prodotte": report.produced,
-        "sopravvissute": report.survived,
-        "scartate (guardrail)": report.produced - report.survived,
-        "REBEL prodotte": report.rebel_produced,
-        "REBEL confermate": report.rebel_matched,
-        "REBEL rigettate": report.rebel_rejected,
-        "triple finali da REBEL": report.rebel_kept,
-        "LLM calls": report.llm_calls,
-        "sec": round(report.seconds, 2),
-    })
-    return rows
-
-
-def _render_report(report) -> None:
-    import pandas as pd
-    from src.ingestion.hybrid_extractor import VARIANT_LABELS, ORIGIN_REBEL_CONFIRMED
-
-    st.markdown(f"#### Variante {VARIANT_LABELS[report.variant]}")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Triple prodotte", report.produced)
-    c2.metric("Sopravvissute ai guardrail", report.survived)
-    c3.metric("REBEL rigettate", f"{report.rebel_rejected} / {report.rebel_produced}")
-    c4.metric("Contributo REBEL", f"{report.rebel_kept} triple finali",
-              help="Triple finali nate da un candidato REBEL. Piu' candidati REBEL "
-                   "con lo stesso (subject, object) collassano in una sola tripla, "
-                   "quindi e' <= 'REBEL confermate'.")
-
-    st.dataframe(pd.DataFrame(_passage_rows(report)),
-                 use_container_width=True, hide_index=True)
-
-    reasons = report.discard_reasons
-    if reasons:
-        st.caption("Motivi di scarto (guardrail)")
-        st.dataframe(
-            pd.DataFrame([{"motivo": k, "triple": v} for k, v in reasons.most_common()]),
-            use_container_width=True, hide_index=True,
-        )
-
-    for err in report.errors:
-        st.error(err)
-
-    for p in report.passages:
-        with st.expander(
-            f"[{p.chunk_index}] {p.title} | `{p.source_id}` | "
-            f"{p.produced} prodotte -> {len(p.survived)} sopravvissute | "
-            f"REBEL {len(p.rebel_raw)} -> rigettate {len(p.rebel_rejected)}",
-            expanded=False,
-        ):
-            st.markdown("**Testo originale (evidenza verbatim)**")
-            st.markdown(f'<div class="chunk-box">{p.original_text}</div>',
-                        unsafe_allow_html=True)
-            if p.resolved_text != p.original_text:
-                st.markdown("**Testo coref-risolto (input ai modelli)**")
-                st.markdown(f'<div class="chunk-box">{p.resolved_text}</div>',
-                            unsafe_allow_html=True)
-            st.caption(f"{len(p.sentences)} frasi -> REBEL ({p.rebel_seconds:.2f}s) "
-                       f"| DeepSeek {p.llm_calls} call ({p.llm_seconds:.2f}s)")
-
-            st.markdown("**Triple REBEL grezze**")
-            if p.rebel_raw:
-                for t in p.rebel_raw:
-                    _triple_line(t["subject"], t["predicate"], t["obj"])
-            else:
-                st.caption("-- nessuna tripla REBEL")
-
-            if p.deepseek_first_pass:
-                st.markdown("**DeepSeek passata 1 (senza vedere REBEL)**")
-                for t in p.deepseek_first_pass:
-                    _triple_line(t["subject"], t["predicate"], t["obj"])
-
-            st.markdown(f"**Triple finali sopravvissute ({len(p.survived)})**")
-            if p.survived:
-                for t in p.survived:
-                    _triple_line(t.subject, t.predicate, t.obj, f"origin: {t.origin}")
-                    st.markdown(f'<div class="span-label">span: {t.claim_span}</div>',
-                                unsafe_allow_html=True)
-            else:
-                st.caption("-- nessuna tripla sopravvissuta")
-
-            if p.discarded:
-                st.markdown(f"**Scartate dai guardrail ({len(p.discarded)})**")
-                for t in p.discarded:
-                    _triple_line(t.subject, t.predicate, t.obj,
-                                 f"scartata: {t.reason} | origin: {t.origin}")
-
-            if p.rebel_rejected:
-                st.markdown(f"**Triple REBEL rigettate ({len(p.rebel_rejected)})**")
-                for r in p.rebel_rejected:
-                    _triple_line(r.subject, r.predicate, r.obj, f"motivo: {r.reason}")
-
-
-def _render_hybrid_tab() -> None:
-    """Debug della pipeline ibrida: nessuna scrittura su Neo4j, solo JSONL + UI."""
-    import pandas as pd
-    from src.ingestion.hybrid_extractor import RunReport, VARIANTS, VARIANT_LABELS
-    from src.ingestion.output_store import save_hybrid_report
-
-    st.markdown("### Pipeline ibrida REBEL + DeepSeek")
-    st.markdown(
-        "<p style='color:#94a3b8;font-size:.9rem;'>"
-        "Ordine fisso: coref -> sentence split -> estrazione. Due varianti a confronto:"
-        "<br><strong>A</strong> - REBEL estrae, DeepSeek riceve passaggio + triple REBEL "
-        "e produce il set finale (corregge, scarta, completa). 1 chiamata LLM/passaggio."
-        "<br><strong>B</strong> - DeepSeek estrae da solo (senza vedere REBEL), poi REBEL "
-        "estrae e DeepSeek fa da validatore sulle sue triple. 2 chiamate LLM/passaggio."
-        "<br>Ogni tripla finale deve avere uno span <em>verbatim</em> del testo originale "
-        "che contiene subject e object; i guardrail scartano predicato assente, "
-        "subject == object, object = intera frase, span mancante."
-        "</p>",
-        unsafe_allow_html=True,
-    )
-
-    loader = get_alce_loader()
-    if not loader.exists():
-        st.error(f"Corpus non trovato: `{loader.path}`")
-        return
-
-    if not get_deepseek().is_available():
-        st.warning("`DEEPSEEK_API_KEY` non configurata: la pipeline ibrida non puo' girare.")
-
-    col_q, col_v = st.columns([2, 1])
-    with col_q:
-        search_q = st.text_input("Filtra domande", key="hyb_search",
-                                 placeholder="es. 'world cup', 'president'...")
-    with col_v:
-        variants = st.multiselect(
-            "Varianti da eseguire", options=list(VARIANTS), default=[VARIANTS[0]],
-            format_func=lambda v: VARIANT_LABELS[v], key="hyb_variants",
-        )
-
-    filtered = loader.search(search_q, limit=200)
-    if not filtered:
-        st.info("Nessuna domanda corrisponde al filtro.")
-        return
-
-    selected = st.selectbox("Domanda", options=filtered,
-                            format_func=lambda e: e.question, key="hyb_question")
-    st.caption(f"sample_id: `{selected.sample_id}` -- {len(selected.docs())} passaggi")
-
-    col_c, col_n, col_r = st.columns([1, 1, 2])
-    with col_c:
-        skip_coref = st.checkbox("Salta coref", value=False, key="hyb_skip_coref")
-    with col_n:
-        n_docs = st.number_input("Passaggi", min_value=1, max_value=len(selected.docs()),
-                                 value=len(selected.docs()), key="hyb_n_docs")
-    with col_r:
-        run_btn = st.button("Esegui pipeline ibrida", type="primary",
-                            use_container_width=True,
-                            disabled=(not variants or not get_deepseek().is_available()))
-
-    if run_btn:
-        from src.ingestion.output_store import save_coref
-
-        chunks = selected.docs()[:int(n_docs)]
-        resolver = None if skip_coref else get_debug_coref_resolver()
-        reports = {}
-
-        with st.status("Pipeline ibrida in corso...", expanded=True) as stage:
-            # Coref una volta sola: le varianti devono partire dallo stesso input.
-            resolved_map = {}
-            for chunk in chunks:
-                sid = chunk["source_id"]
-                original = chunk.get("text", "")
-                stage.update(label=f"coref {sid}...")
-                resolved = resolver.resolve(original) if resolver else original
-                resolved_map[sid] = resolved
-                save_coref(
-                    source_id=sid, sample_id=selected.sample_id,
-                    title=chunk.get("title", ""), chunk_index=chunk.get("chunk_index", 0),
-                    original_text=original, resolved_text=resolved,
-                )
-
-            for variant in variants:
-                extractor = get_hybrid_extractor(variant)
-                report = RunReport(variant=variant, sample_id=selected.sample_id,
-                                   question=selected.question)
-                for chunk in chunks:
-                    stage.update(label=f"variante {variant}: {chunk['source_id']}...")
-                    report.passages.append(
-                        extractor.run_passage(chunk, resolved_map[chunk["source_id"]])
-                    )
-                counts = save_hybrid_report(report)
-                reports[variant] = report
-                stage.update(label=f"variante {variant}: {counts['survived']} triple salvate")
-
-            stage.update(label="Pipeline ibrida completata", state="complete")
-
-        st.session_state["hybrid_reports"] = {
-            "sample_id": selected.sample_id,
-            "reports": reports,
-        }
-
-    data = st.session_state.get("hybrid_reports")
-    if not data or data["sample_id"] != selected.sample_id:
-        st.caption("Nessun risultato per questa domanda. Esegui la pipeline.")
-        return
-
-    reports = data["reports"]
-
-    if len(reports) > 1:
-        st.markdown("#### Confronto varianti")
-        st.dataframe(pd.DataFrame([
-            {
-                "variante": v,
-                "triple prodotte": r.produced,
-                "sopravvissute": r.survived,
-                "REBEL prodotte": r.rebel_produced,
-                "REBEL confermate": r.rebel_matched,
-                "REBEL rigettate": r.rebel_rejected,
-                "triple finali da REBEL": r.rebel_kept,
-                "LLM calls": r.llm_calls,
-                "sec": round(r.seconds, 2),
-            }
-            for v, r in reports.items()
-        ]), use_container_width=True, hide_index=True)
-
-    for variant, report in reports.items():
-        _render_report(report)
-
-    st.caption(
-        "Output su `data/outputs/`: `triples_hybrid.jsonl` (sopravvissute), "
-        "`triples_hybrid_discarded.jsonl` (scartate + motivo), "
-        "`hybrid_runs.jsonl` (statistiche di run). Nessuna scrittura su Neo4j."
-    )
-
-
-with tab_hybrid:
-    _render_hybrid_tab()
 
 
 
 # ──────────────────────────────────────────────────────────────────────
-# TAB 2 — CLAIM ATTRIBUTION
+# TAB — CLAIM ATTRIBUTION
 # ──────────────────────────────────────────────────────────────────────
 
 with tab_claim:
@@ -930,7 +655,8 @@ with tab_claim:
     st.markdown(
         "<p style='color:#94a3b8;font-size:.9rem;'>"
         "Enter a statement (claim) <em>or</em> a question. "
-        "Statements are parsed via mREBEL and verified against the graph. "
+        "Statements are parsed via DeepSeek -- the same extractor that built "
+        "the graph -- and verified against it. "
         "Questions are converted to a partial triple via LLM and resolved "
         "using pattern query + cosine similarity on the predicate."
         "</p>",
@@ -943,15 +669,11 @@ with tab_claim:
         height=80,
     )
 
-    # Extractor filter applies to ALL attribution queries:
-    # rebel/deepseek graphs must never be queried together.
-    query_extractor = st.radio(
-        "Graph to query (extractor)",
-        options=settings.AVAILABLE_EXTRACTORS,
-        index=settings.AVAILABLE_EXTRACTORS.index(settings.ACTIVE_EXTRACTOR)
-        if settings.ACTIVE_EXTRACTOR in settings.AVAILABLE_EXTRACTORS else 0,
-        horizontal=True,
-    )
+    # Filtro di provenienza applicato a TUTTE le query di attribution: un
+    # grafo vecchio scritto da un altro estrattore non va mai interrogato
+    # insieme a questo.
+    query_extractor = settings.ACTIVE_EXTRACTOR
+    st.caption(f"Graph queried: archi con `extractor = {query_extractor}`.")
 
     verify_btn = st.button(
         "Verify / Answer",

@@ -1,6 +1,12 @@
 """
 Entity clusterer — merges semantically-equivalent Entity nodes in Neo4j.
 Uses SentenceTransformers embeddings + cosine similarity clustering.
+
+LEGACY (dal 2026-09-03): lavora sul grafo GIA' scritto.  La canonicalizzazione
+di pipeline e' ora una fase pre-write —
+`src/ingestion/entity_canonicalizer.py`, che riusa questo stesso stadio a
+embedding come STADIO 4 (ripiego) dopo tre stadi deterministici.  Questo modulo
+resta per pulire grafi vecchi.
 """
 
 from __future__ import annotations

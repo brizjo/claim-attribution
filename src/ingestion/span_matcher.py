@@ -158,3 +158,37 @@ def anchor_span_aligned(
     if span_orig is not None:
         return span_orig, span_orig
     return None
+
+
+def align_sentences(
+    original_sents: list[str], resolved_sents: list[str],
+) -> list[tuple[str, str]]:
+    """
+    Accoppia le frasi del testo ORIGINALE con quelle del testo coref-risolto.
+
+    La coref sostituisce menzioni in-place, quindi di norma il numero di frasi
+    si conserva e l'accoppiamento e' per indice.  Quando i due split divergono
+    (una sostituzione ha introdotto o rimosso un confine di frase) si accoppia
+    ogni frase risolta con la frase originale a massimo overlap lessicale,
+    scorrendo in avanti: l'evidenza salvata resta comunque verbatim.
+    """
+    if not resolved_sents:
+        return [(s, s) for s in original_sents]
+    if len(original_sents) == len(resolved_sents):
+        return list(zip(original_sents, resolved_sents))
+
+    pairs: list[tuple[str, str]] = []
+    cursor = 0
+    for res in resolved_sents:
+        res_tokens = _tokens(res)
+        best_idx, best_score = cursor, -1.0
+        for idx in range(cursor, len(original_sents)):
+            overlap = len(res_tokens & _tokens(original_sents[idx]))
+            if overlap > best_score:
+                best_idx, best_score = idx, overlap
+        if best_score <= 0:
+            pairs.append((original_sents[min(cursor, len(original_sents) - 1)], res))
+            continue
+        pairs.append((original_sents[best_idx], res))
+        cursor = min(best_idx + 1, len(original_sents) - 1)
+    return pairs

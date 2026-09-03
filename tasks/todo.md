@@ -153,3 +153,172 @@ Neo4j fuori scopo: solo JSONL + UI.
 
 ### Fuori scopo
 - Scrittura Neo4j (nessuna modifica a graph_writer/neo4j_client).
+
+## Phase 16: Fix pipeline ibrida + esperimento A/D su 10 domande (2026-09-02)
+
+Contesto: il primo giro aveva 38/153 span vuoti (chiesti al modello), nodi
+generici tipo "game" con 14 archi, 10 triple con deittici irrisolti, contatori
+REBEL incoerenti e due run non riproducibili sullo stesso input.
+
+### FIX
+- [x] **FIX 1 — span dalla pipeline.** Unita' di lavoro = la frase: coref sul
+      passaggio, split, `align_sentences(originale, risolto)`. `claim_span` =
+      frase ORIGINALE allineata; il campo span e' stato TOLTO dallo schema JSON
+      chiesto al modello. Il motivo di scarto `no_span` non esiste piu'.
+- [x] **FIX 2 — guardrail dove servono.** `entity_not_in_sentence` (match
+      normalizzato + fuzzy leggero su morfologia/accenti), `generic_node`
+      (NER/POS spaCy: niente named entity, niente PROPN, niente numero/data ->
+      scarto), `unresolved_reference` (pronomi, "that same year", "the
+      subsequent game"), `subject_equals_object`, `no_predicate`.
+- [x] **FIX 3 — coref rumorosa.** `CoreferenceResolver` solleva
+      `CorefUnavailable` invece di degradare; `check()` come health check; il
+      runner si ferma con exit code 2 se il coref non carica. Pin
+      `transformers>=4.41,<4.56` gia' presente e verificato (4.55.4 in venv).
+- [x] **FIX 4 — contatori.** Ogni candidato REBEL ha uno e un solo stato
+      (`confirmed` | `validated` | `rejected_llm` | `rejected_guardrail`)
+      assegnato per indice. Un "keep" del validatore poi ucciso dai guardrail
+      NON conta come confermato. Invariante testata.
+- [x] **FIX 5 — riproducibilita'.** Cache LLM su disco in `DeepSeekClient`,
+      chiave = SHA256 di (modello, temperatura, max_tokens, messaggi), log
+      HIT/MISS, `cache_stats()` in UI e nel runner. `LLM_CACHE=0` per forzare
+      chiamate fresche.
+
+### Esperimento
+- [x] `scripts/run_hybrid_experiment.py` — 10 domande ASQA, varianti A e D,
+      REBEL eseguito una volta sola e condiviso, chiamate LLM parallele.
+- [x] Variante A: frase + vocabolario dei predicati REBEL (NON le triple).
+      Il vocabolario si ricava dall'output REBEL sul corpus: `rebel-large` e'
+      un BART seq2seq, il suo `id2label` e' `LABEL_0/1/2` e non contiene le
+      relazioni.
+- [x] Variante D: DeepSeek cieco per frase -> confronto programmatico su
+      (subject, object) -> una sola chiamata di validazione per i candidati
+      REBEL residui. Variante B eliminata.
+- [x] `src/ingestion/hybrid_analysis.py` — conferma REBEL per predicato, archi
+      per nodo, diff A vs D.
+- [x] `tests/test_hybrid_pipeline.py` — 22 test, nessuna rete.
+- [x] UI: tab riscritto su A/D con le tre tabelle nuove + stato cache LLM.
+
+### Fuori scopo
+- Neo4j (nessuna scrittura, nessuna modifica a graph_writer/neo4j_client).
+
+### Risultati del giro (10 domande ASQA, 50 passaggi, 267 frasi, 2026-09-02)
+
+Vocabolario REBEL ricavato dall'output: 117 predicati distinti.
+
+| | A (vocabolario) | D (cieca + validazione) |
+|---|---|---|
+| triple prodotte | 434 | 772 |
+| sopravvissute ai guardrail | 308 | 565 |
+| scartate | 126 | 207 |
+| REBEL prodotte | 865 | 865 |
+| REBEL confermate | 96 (**11.1%**) | 238 (**27.5%**) |
+| triple finali da accordo | 81 | 89 |
+| triple finali solo REBEL (validate) | 0 | 122 |
+| LLM calls | 267 | 317 |
+
+- Scarti A: generic_node 65, duplicate 37, entity_not_in_sentence 20,
+  unresolved_reference 2, subject_equals_object 2. Zero `no_span`.
+- Scarti D: generic_node 93, duplicate 43, entity_not_in_sentence 36,
+  subject_equals_object 15, no_predicate 15, unresolved_reference 5.
+- Diff A/D: 219 comuni, 82 solo A, 322 solo D. Il vocabolario REBEL RIDUCE la
+  resa: A produce meno triple e con predicati piu' poveri (es. perde
+  "Josef Bican | birth date | 25 September 1913").
+- Conferma REBEL per predicato (D): `participating team` 66.7%,
+  `located in the administrative territorial entity` 59.3%, `location` 58.8%,
+  `inception` 54.2%, `performer` 50.0% vs `subclass of` 0%, `sport` 0%,
+  `instance of` 4%, `date of birth` 15.4%. La media aggregata nasconde questa
+  spaccatura: REBEL e' utile solo su un sottoinsieme di relazioni.
+
+### Riproducibilita verificata
+- Run 1 e run 2 divergevano di 2 triple in D: race sulla cache (due thread con
+  lo stesso prompt, entrambi in miss, due risposte diverse dall API). Fix:
+  single-flight in `DeepSeekClient` + test in `tests/test_llm_cache.py`.
+- Run 2 vs run 3 (cache calda, 584 hit / 0 miss): summary, tabella predicati,
+  archi per nodo, motivi di scarto e diff A/D **identici**. I numeri riportati
+  qui sopra sono quelli di run 2/3.
+
+### Aperto
+- [ ] Decisione su REBEL: tenerlo solo per le relazioni con conferma > ~50%,
+      oppure eliminarlo (costa ~20s/passaggio su CPU e porta 0 triple esclusive
+      in A, 122 in D).
+- [ ] I nodi-calamita residui sono entita' legittime (topic della domanda):
+      "The Sound of Silence" 28 archi su 5 passaggi. Serve una regola sui nodi
+      con nome ambiguo ("Louise", 19 archi su 5 passaggi) — probabile lavoro
+      di entity linking, non di guardrail.
+
+## Canonicalizzazione pre-write + separazione UI esperimenti (2026-09-03)
+
+### Parte 1 — terza fase: extract -> canonicalize -> write
+- [x] `src/ingestion/entity_canonicalizer.py`: cascata a 4 stadi
+      (normalizzazione / lessicale / linking / embedding), scope parametrico
+      `per_passage | per_question | global` (default `per_question`).
+- [x] `surface_form` conservata sull'arco (`subject_surface`/`object_surface`),
+      `external_id` sul nodo (`_MERGE_TRIPLE` aggiornata).
+- [x] Embedding dei predicati spostato da GraphWriter alla canonicalizzazione
+      (un batch per domanda; GraphWriter lo calcola solo se manca).
+- [x] Log `data/outputs/canonicalization.jsonl` — una riga per OCCORRENZA di
+      menzione (`output_store.save_canonicalization`).
+- [x] `scripts/analyze_canonicalization.py` — stadi, merge, archi per nodo,
+      nodi prima/dopo.
+- [x] `tests/test_entity_canonicalizer.py` — 31 test, nessuna rete.
+- [x] `merge_entity_into_canonical` + `EntityClusterer` marcati legacy.
+- [x] UI: lo Step 6 canonicalizza prima di scrivere e mostra il riepilogo.
+
+### Parte 2 — UI
+- [x] `src/ui/resources.py` (risorse cached condivise) + `src/ui/experiments.py`
+      con `render()`.
+- [x] Tab esperimenti solo con `SHOW_EXPERIMENTS=1` (default nascosto).
+- [x] Documentato in `.env.example` e `regole_progetto.md`.
+- [x] `tests/test_ui_modes.py` — AppTest su entrambe le modalita'.
+
+### Review
+- Pipeline: `extract_entry` -> `canonicalize_entry` -> `write_entry`.
+  `write_entry` non calcola piu' nulla: riceve triple canonicalizzate e gia'
+  embeddate.
+- Prova end-to-end su dati ALCE-like (5 triple, 3 passaggi, 1 domanda):
+  `Josef "Pepi" Bican (25 Sept 1913)`, `Bican`, `Bican's record` e
+  `Josef Bican` collassano su `Josef Bican` (external_id
+  `wikipedia:Josef Bican`); `VanDeWeghe` -> `Kiki VanDeWeghe`;
+  `Soccer Statistics Foundation (RSSSF)` -> `Soccer Statistics Foundation`.
+  10 menzioni, 10 -> 7 nodi, **100% chiuse agli stadi 1-3** (7 / 2 / 1 / 0).
+  La percentuale sul corpus vero va misurata con lo script, non assunta.
+- `app.py`: 1114 -> 754 righe.
+- Test: 56 passati. Restano 7 fallimenti PRE-ESISTENTI in
+  `tests/test_hybrid_pipeline.py`, tutti `ModuleNotFoundError: spacy`
+  nell'ambiente usato per i test (guardrail `generic_node`), non toccati da
+  queste modifiche.
+
+### Aperto
+- [ ] Ri-tarare `ENTITY_CLUSTER_THRESHOLD` (0.90) per lo stadio 4 sui dati
+      reali: dopo gli stadi 1-3 gli restano solo i casi difficili, quindi la
+      soglia attuale e' un'ipotesi da verificare sul log.
+- [ ] Il grafo esistente NON e' migrato: va rigenerato per avere
+      `surface_form`/`external_id` sugli archi e sui nodi.
+
+## REBEL fuori dalla pipeline principale (2026-09-03)
+
+Estrattore unico: DeepSeek. REBEL resta solo negli esperimenti (il loro scopo
+e' proprio misurare quanto aggiunge — vedi i numeri della fase ibrida sopra).
+
+- [x] `settings`: `AVAILABLE_EXTRACTORS = ["deepseek"]`, `ACTIVE_EXTRACTOR`
+      default `deepseek`. `EXTRACTOR_REBEL` resta come ETICHETTA per gli archi
+      dei grafi vecchi, che restano interrogabili.
+- [x] `build_extractor`: costruisce solo DeepSeek; con `"rebel"` alza un
+      ValueError che indirizza agli esperimenti.
+- [x] `ClaimAttributor`: il claim si parsa con `DeepSeekExtractor` (simmetria di
+      estrazione, `regole_progetto.md` §4) + errore esplicito se la chiave API
+      manca, invece di "nessuna tripla estratta".
+- [x] UI: via il radio dell'estrattore nello Step 1 e il selettore di grafo nel
+      tab Claim Attribution; `get_debug_rebel_extractor` spostato da
+      `src/ui/resources.py` a `src/ui/experiments.py` (unico consumatore).
+- [x] `.env` / `.env.example`: `ACTIVE_EXTRACTOR=deepseek` — con `rebel` la
+      pipeline avrebbe scritto archi `deepseek` e l'attribution avrebbe
+      interrogato solo quelli `rebel` (grafo pieno, zero risultati).
+- [x] `triple_extractor.py` marcato "fuori dalla pipeline": resta perche' ci
+      vive anche la NamedTuple `Triple`, usata da tutto il sistema.
+- [x] `tests/test_pipeline_extractor.py` — 7 test contro il rientro silenzioso
+      di REBEL.
+
+### Aperto
+- [ ] Il grafo scritto con `extractor="rebel"` non e' migrato: va rigenerato con
+      DeepSeek (o interrogato di proposito con `ACTIVE_EXTRACTOR=rebel`).
