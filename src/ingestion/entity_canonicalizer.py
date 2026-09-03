@@ -81,7 +81,30 @@ _NICKNAME = re.compile(r'\s*["“”][^"“”]{1,40}["“”]\s*')
 # `Levi's` / `McDonald's` (nessun token dopo) restano intatti: li' l'apostrofo fa
 # parte del nome.
 _GENITIVE = re.compile(r"^(?P<owner>.+?)'s\s+\S.*$")
-_LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+# Testa non identificante: articolo o preposizione.  Si rimuove in ciclo,
+# perche' si accumulano ("in the country" -> "country").
+#
+# Le preposizioni sono qui e non solo nel guardrail `prepositional_object`
+# perche' la normalizzazione deve valere anche sulle menzioni che il
+# guardrail lascia passare (soggetti, e tutto lo storico gia' estratto):
+# senza lo strip, "in Ireland" non si unifica con "Republic of Ireland" a
+# NESSUNO dei 4 stadi (containment fallisce perche' `in` non e' nella forma
+# lunga, lessicale 0.62, coseno 0.65, entrambe sotto 0.90).  Con lo strip
+# la fusione la fa lo stadio 2, deterministico.
+#
+# Costo noto: i titoli che iniziano davvero con una preposizione perdono la
+# testa ("Of Mice and Men" -> "Mice and Men").  E' lo stesso compromesso gia'
+# accettato per l'articolo ("The Sound of Silence" -> "Sound of Silence"): la
+# forma normalizzata e' una CHIAVE di identita', non il nome da mostrare, e
+# la menzione verbatim resta sull'arco (`subject_surface`/`object_surface`).
+_LEADING_HEAD = re.compile(
+    r"^(?:the|a|an|"
+    r"in|on|at|of|to|from|by|for|with|as|into|onto|upon|over|under|"
+    r"after|before|during|since|until|till|within|without|between|among|"
+    r"amongst|through|throughout|across|against|about|around|near|beside|"
+    r"behind|beyond|per|via)\b\s+",
+    re.IGNORECASE,
+)
 _WS = re.compile(r"\s+")
 _TOKEN = re.compile(r"[0-9a-z]+")
 _TRIM_CHARS = " \t\r\n,;:.-–—·"
@@ -100,7 +123,13 @@ def normalize_mention(text: str) -> str:
     m = _GENITIVE.match(s)
     if m:
         s = m.group("owner")
-    s = _LEADING_ARTICLE.sub("", s)
+    # In ciclo: "in the country" perde `in` e poi `the`.  Lo strip si ferma
+    # se svuoterebbe la menzione ("The" da solo resta "The").
+    while True:
+        stripped = _LEADING_HEAD.sub("", s, count=1).strip()
+        if not stripped or stripped == s:
+            break
+        s = stripped
     s = s.strip(_TRIM_CHARS)
     return _WS.sub(" ", s).strip()
 
@@ -118,18 +147,94 @@ def _key(text: str) -> str:
 # Stadio 2 — regole lessicali deterministiche
 # ────────────────────────────────────────────────────────────────────
 
+# Congiunzione coordinante: attraversarla in containment fonde due entita'
+# distinte (v. sotto).  `_tokens` non produce `&`, quindi bastano le parole.
+_COORD_TOKENS = frozenset({"and", "or"})
+_HAS_UPPER = re.compile(r"[A-Z]")
+
+
 def is_token_containment(short: str, long: str) -> bool:
     """
     `VanDeWeghe` ⊂ `Kiki VanDeWeghe`.  Vincoli contro le fusioni facili:
     la forma corta deve avere almeno un token alfabetico di 3+ caratteri
-    (esclude `1961` ⊂ `1961 World Cup` e le sigle di una lettera).
+    (esclude `1961` ⊂ `1961 World Cup` e le sigle di una lettera) e deve
+    contenere la TESTA della forma lunga (l'ultimo token): un cognome o il
+    nome del prodotto, non un modificatore.
+
+    Senza il vincolo sulla testa bastava UN token condiviso e l'union-find
+    faceva valanga (osservata sul corpus reale, 2026-09-03): "Apple" ⊂
+    "Apple iPhone" e "Apple" ⊂ "History of Apple Inc" fondevano "Apple",
+    "iPhone" e "History of Apple Inc" in un nodo solo — e il linker, che usa
+    la stessa regola, battezzava il cluster col titolo sbagliato.
+
+    Due vincoli aggiunti il 2026-09-03 dopo il campione Irlanda
+    (`tasks/issues_canonicalizzazione.md`):
+
+    * **mai attraversare una coordinazione.**  `Fine Gael` ⊂ `Fianna Fail and
+      Fine Gael` passava il vincolo sulla testa (`gael` e' l'ultimo token
+      della congiunzione) e il partito veniva assorbito dal blob dei due
+      partiti; `Fianna Fail`, che sta in testa, non veniva assorbito.
+      Asimmetria pura: chi finisce in coda alla congiunzione sparisce.
+    * **la forma corta deve sembrare un nome proprio.**  La regola sulla
+      testa non distingue un cognome da un sostantivo comune, quindi fondeva
+      `seats` ⊂ `20 seats`, `government` ⊂ `coalition government` e
+      `recent general election` ⊂ `outcome of the recent general election`
+      (un'elezione non e' l'esito di un'elezione).  Il proxy e' la maiuscola:
+      deterministico, senza spaCy — lo stadio 2 deve restare tale — e
+      sufficiente sui casi osservati.  I numeri restano gestiti dal vincolo
+      precedente, che li esclude a monte.
     """
     a, b = _tokens(short), _tokens(long)
     if not a or not b or len(a) >= len(b):
         return False
+    # Una forma lunga di 7+ token e' una FRASE descrittiva, non un nome:
+    # "Apple Inc" ⊂ "first smartphone model designed and marketed by Apple
+    # Inc" condivide la testa ("Inc") ma l'entita' e' il modello, non Apple.
+    if len(b) > 6:
+        return False
     if not any(len(t) >= 3 and not t.isdigit() for t in a):
         return False
-    return set(a).issubset(set(b))
+    # La forma lunga coordina, la corta no: sono due entita' diverse.
+    if (_COORD_TOKENS & set(b)) - set(a):
+        return False
+    # Nome proprio (o sigla) richiesto nella forma corta.
+    if not _HAS_UPPER.search(short):
+        return False
+    short_set = set(a)
+    if b[-1] not in short_set:
+        return False
+    return short_set.issubset(set(b))
+
+
+# Titoli Wikipedia "meta": l'articolo parla DI un'entita', non E' l'entita'.
+# "History of Apple Inc." non e' Apple Inc: linkare la menzione "Apple Inc"
+# a quel titolo battezzerebbe l'azienda col nome della sua storia.
+_META_TITLE = re.compile(
+    r"^(history|list|timeline|geography|economy|demographics|discography|"
+    r"filmography|bibliography) of\b",
+    re.IGNORECASE,
+)
+
+
+def is_title_containment(mention: str, title: str) -> bool:
+    """
+    Menzione ⊂ TITOLO del passaggio (stadio 3).  Più lasco dello stadio 2:
+    il titolo porta gia' il contesto giusto (la frase viene da quel
+    passaggio), quindi oltre alla testa ("VanDeWeghe" ⊂ "Kiki VanDeWeghe")
+    vale anche il PREFISSO ("Louise" ⊂ "Louise Brown" — il primo nome usato
+    da solo).  I titoli META ("History of X", "List of X") non linkano mai
+    per containment: l'articolo parla dell'entita', non la nomina.
+    """
+    if _META_TITLE.match(title):
+        return False
+    if is_token_containment(mention, title):
+        return True
+    a, b = _tokens(mention), _tokens(title)
+    if not a or not b or len(a) >= len(b):
+        return False
+    if not any(len(t) >= 3 and not t.isdigit() for t in a):
+        return False
+    return b[: len(a)] == a
 
 
 def is_initials_abbreviation(a: str, b: str) -> bool:
@@ -192,10 +297,17 @@ class TitleLinker:
             tk = _key(normalize_mention(title))
             if not tk:
                 continue
-            if mk == tk or is_token_containment(mention, normalize_mention(title)):
+            if mk == tk or is_title_containment(mention, normalize_mention(title)):
                 matches.add(title)
         if len(matches) == 1:
-            return f"wikipedia:{normalize_mention(next(iter(matches)))}"
+            # ID esterno costruito sul titolo INTEGRALE, disambiguatore
+            # compreso: "wikipedia:Labour Party (Ireland)".  Normalizzarlo
+            # qui butterebbe "(Ireland)", cioe' esattamente cio' che
+            # distingue l'entita', e con `scope=global` il Labour Party
+            # irlandese collasserebbe su quello britannico senza un segnale.
+            # L'ID deve discriminare; l'etichetta leggibile la ricava
+            # `_external_label`, che normalizza.
+            return f"wikipedia:{_WS.sub(' ', next(iter(matches)).strip())}"
         return None
 
 
@@ -252,10 +364,18 @@ class SpotlightLinker:
 
 
 def _external_label(external_id: str) -> str:
-    """Etichetta leggibile di un ID esterno, se ce l'ha (`wikipedia:<titolo>`).
-    Gli URI DBpedia non danno garanzie sul label: restano senza etichetta."""
+    """
+    Etichetta leggibile di un ID esterno, se ce l'ha (`wikipedia:<titolo>`).
+
+    L'ID porta il titolo integrale per essere discriminante
+    (`wikipedia:Labour Party (Ireland)`); l'etichetta e' il nome da mostrare
+    sul nodo, quindi passa dalla normalizzazione ("Labour Party").  Sono due
+    cose diverse e devono restare separate.
+
+    Gli URI DBpedia non danno garanzie sul label: restano senza etichetta.
+    """
     if external_id.startswith("wikipedia:"):
-        return external_id.split(":", 1)[1].strip()
+        return normalize_mention(external_id.split(":", 1)[1])
     return ""
 
 

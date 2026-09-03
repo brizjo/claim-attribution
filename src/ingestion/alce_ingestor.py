@@ -398,19 +398,20 @@ class AlceIngestor:
         all'estrattore (lo span verbatim sull'originale si assegna dopo).
         """
         anchorer = self._get_anchorer()
+        title = chunk.get("title", chunk.get("source_file", ""))
         kept: list[Triple] = []
         failed: dict[str, list[tuple[Triple, str]]] = {}
         for t in raw_triples:
             sentence = t.chunk_text
             verdict = guardrails.check(
-                t.subject, t.predicate, t.obj, sentence, anchorer=anchorer)
+                t.subject, t.predicate, t.obj, sentence,
+                anchorer=anchorer, title=title)
             if verdict.ok:
                 kept.append(t)
             else:
                 failed.setdefault(sentence, []).append((t, verdict.reason))
 
         records: list[dict] = []
-        title = chunk.get("title", chunk.get("source_file", ""))
         # Il Protocol `Extractor` non impone un client LLM: gli stub dei test
         # e gli estrattori sperimentali senza `.client` saltano il repair.
         repair_client = getattr(self._extractor, "client", None)
@@ -431,7 +432,7 @@ class AlceIngestor:
                     repair_client, sentence, title, rejected):
                 verdict = guardrails.check(
                     item["subject"], item["predicate"], item["obj"],
-                    sentence, anchorer=anchorer)
+                    sentence, anchorer=anchorer, title=title)
                 if verdict.ok:
                     result.repaired += 1
                     kept.append(Triple(

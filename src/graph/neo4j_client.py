@@ -16,11 +16,19 @@ class Neo4jClient:
 
     Schema:
         (:Entity {name, normalized_name, external_id})
-        -[:RELATES_TO {predicate, chunk_text, claim_span, source_file,
+        -[:`<predicato>` {predicate, chunk_text, claim_span, source_file,
                         source_id, extractor, chunk_index,
                         predicate_embedding,
                         subject_surface, object_surface}]->
 
+      * il TIPO della relazione e' il predicato INTEGRALE (2026-09-03):
+        backtick-quoted, quindi spazi e unicode sono ammessi.  Nel Browser
+        l'arco mostra "born in", non piu' un generico RELATES_TO.
+      * `predicate` resta ANCHE come property: e' il metadato su cui lavora
+        il matching (exact match case-insensitive sulla property, fallback
+        semantico sull'embedding) — il tipo e' presentazione, la property e'
+        la chiave logica.  Le query di lettura NON filtrano per tipo:
+        matchano `-[r]->` fra :Entity e usano le property.
       * `name` / `normalized_name` = forma CANONICA (vedi
         `src/ingestion/entity_canonicalizer.py`);
       * `subject_surface` / `object_surface` = menzione verbatim nel testo:
@@ -74,16 +82,11 @@ class Neo4jClient:
                 "CREATE CONSTRAINT document_unique IF NOT EXISTS "
                 "FOR (d:Document) REQUIRE d.name IS UNIQUE"
             )
-            # Indice sulla chiave di provenienza: rende O(1) il check di
-            # idempotenza per documento.  Richiede Neo4j 5.x — su versioni
-            # più vecchie si degrada a scan, non è un errore fatale.
-            try:
-                s.run(
-                    "CREATE INDEX rel_source_extractor IF NOT EXISTS "
-                    "FOR ()-[r:RELATES_TO]-() ON (r.source_id, r.extractor)"
-                )
-            except Exception:
-                pass
+            # NB: l'indice `rel_source_extractor` su RELATES_TO e' stato
+            # rimosso (2026-09-03): con il predicato come TIPO dell'arco i
+            # tipi sono dinamici e un indice per-tipo non e' praticabile.
+            # I check di idempotenza degradano a scan degli archi: accettabile
+            # alla scala del corpus (migliaia di archi).
         self._schema_ready = True
 
     def close(self) -> None:
@@ -93,21 +96,40 @@ class Neo4jClient:
     # Write
     # ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _rel_type(predicate: str) -> str:
+        """
+        Tipo di relazione = predicato INTEGRALE, backtick-quoted.
+
+        I tipi Cypher ammettono spazi e unicode se citati con backtick;
+        l'unico carattere da neutralizzare e' il backtick stesso
+        (raddoppiato).  Il tipo non e' parametrizzabile come `$param`,
+        quindi va interpolato nel testo della query: l'escape rende
+        l'interpolazione sicura.  Un predicato vuoto non arriva mai qui
+        (guardrail `no_predicate`), ma il fallback resta RELATES_TO.
+        """
+        cleaned = (predicate or "").strip()
+        if not cleaned:
+            return "`RELATES_TO`"
+        return "`" + cleaned.replace("`", "``") + "`"
+
     # Chiave dell'arco: (predicate, source_id, extractor). MERGE, mai CREATE.
-    _MERGE_TRIPLE = """
-    MERGE (sub:Entity {normalized_name: $s_norm})
+    # Il tipo e' dinamico (= predicato), percio' la query e' un template da
+    # formattare con `_rel_type(...)` — le graffe Cypher sono raddoppiate.
+    _MERGE_TRIPLE_TEMPLATE = """
+    MERGE (sub:Entity {{normalized_name: $s_norm}})
       ON CREATE SET sub.name = $s_name
     SET sub.external_id = CASE WHEN $s_ext <> ''
                           THEN $s_ext ELSE sub.external_id END
-    MERGE (obj:Entity {normalized_name: $o_norm})
+    MERGE (obj:Entity {{normalized_name: $o_norm}})
       ON CREATE SET obj.name = $o_name
     SET obj.external_id = CASE WHEN $o_ext <> ''
                           THEN $o_ext ELSE obj.external_id END
-    MERGE (sub)-[r:RELATES_TO {
+    MERGE (sub)-[r:{rel_type} {{
         predicate: $pred,
         source_id: $source_id,
         extractor: $extractor
-    }]->(obj)
+    }}]->(obj)
     SET r.chunk_text = $chunk_text,
         r.claim_span = $claim_span,
         r.source_file = $source_file,
@@ -116,6 +138,10 @@ class Neo4jClient:
         r.subject_surface = $s_surface,
         r.object_surface = $o_surface
     """
+
+    def _merge_triple_query(self, predicate: str) -> str:
+        return self._MERGE_TRIPLE_TEMPLATE.format(
+            rel_type=self._rel_type(predicate))
 
     @staticmethod
     def _triple_params(t: dict) -> dict:
@@ -153,7 +179,8 @@ class Neo4jClient:
             tx = s.begin_transaction()
             try:
                 for i, t in enumerate(triples):
-                    tx.run(self._MERGE_TRIPLE, **self._triple_params(t))
+                    tx.run(self._merge_triple_query(t["predicate"]),
+                           **self._triple_params(t))
                     if progress_callback and (i + 1) % 10 == 0:
                         progress_callback(f"Indexed {i + 1}/{len(triples)} triples...")
                 tx.commit()  # explicit — never trust driver auto-commit on exit
@@ -178,7 +205,7 @@ class Neo4jClient:
     ) -> None:
         self._ensure_schema()
         with self._session() as s:
-            s.run(self._MERGE_TRIPLE, **self._triple_params({
+            s.run(self._merge_triple_query(predicate), **self._triple_params({
                 "subject": subject,
                 "predicate": predicate,
                 "obj": obj,
@@ -206,7 +233,8 @@ class Neo4jClient:
         with self._session() as s:
             rec = s.run(
                 """
-                MATCH ()-[r:RELATES_TO {source_id: $sid, extractor: $ext}]->()
+                MATCH (:Entity)-[r]->(:Entity)
+                WHERE r.source_id = $sid AND r.extractor = $ext
                 RETURN count(r) > 0 AS ingested
                 """,
                 sid=str(source_id),
@@ -219,7 +247,7 @@ class Neo4jClient:
         with self._session() as s:
             result = s.run(
                 """
-                MATCH ()-[r:RELATES_TO]->()
+                MATCH (:Entity)-[r]->(:Entity)
                 WHERE r.source_id IS NOT NULL
                   AND ($ext IS NULL OR r.extractor = $ext)
                 RETURN DISTINCT r.source_id AS source_id
@@ -237,8 +265,9 @@ class Neo4jClient:
         with self._session() as s:
             result = s.run(
                 """
-                MATCH (sub:Entity)-[r:RELATES_TO {source_id: $sid}]->(obj:Entity)
-                WHERE $ext IS NULL OR r.extractor = $ext
+                MATCH (sub:Entity)-[r]->(obj:Entity)
+                WHERE r.source_id = $sid
+                  AND ($ext IS NULL OR r.extractor = $ext)
                 RETURN sub.name AS subject,
                        r.predicate AS predicate,
                        obj.name AS object,
@@ -259,8 +288,9 @@ class Neo4jClient:
         with self._session() as s:
             rec = s.run(
                 """
-                MATCH ()-[r:RELATES_TO {source_id: $sid}]->()
-                WHERE $ext IS NULL OR r.extractor = $ext
+                MATCH (:Entity)-[r]->(:Entity)
+                WHERE r.source_id = $sid
+                  AND ($ext IS NULL OR r.extractor = $ext)
                 WITH collect(r) AS rels
                 FOREACH (rel IN rels | DELETE rel)
                 RETURN size(rels) AS deleted
@@ -335,73 +365,22 @@ class Neo4jClient:
         canonical_name: str,
     ) -> None:
         """
-        LEGACY (dal 2026-09-03).  Unire nodi GIA' scritti e' fragile e perde
-        proprieta': la canonicalizzazione avviene ora PRIMA della scrittura, in
-        `src/ingestion/entity_canonicalizer.py`.  Questo metodo resta solo per
-        `EntityClusterer` (post-hoc) e per i grafi vecchi; non usarlo in
-        pipeline nuove.
+        LEGACY (dal 2026-09-03) — ORA DISATTIVATO.
 
-        Merge a duplicate entity into the canonical entity, preserving all
-        relationships.
+        Unire nodi GIA' scritti e' fragile e perde proprieta': la
+        canonicalizzazione avviene PRIMA della scrittura
+        (`src/ingestion/entity_canonicalizer.py`).  In piu', da quando il
+        TIPO dell'arco e' il predicato, i blocchi di copia qui sotto
+        ricreerebbero archi `RELATES_TO` — cioe' CORROMPEREBBERO il grafo
+        mescolando i due schemi.  Meglio un errore esplicito di un merge
+        sbagliato in silenzio.
         """
-        with self._session() as s:
-            with s.begin_transaction() as tx:
-                # Ensure canonical node exists
-                tx.run(
-                    """
-                    MERGE (canon:Entity {normalized_name: $canon_norm})
-                      ON CREATE SET canon.name = $canon_name
-                    """,
-                    canon_norm=canonical_name.lower().strip(),
-                    canon_name=canonical_name,
-                )
-                # Copy outgoing relationships from duplicate to canonical
-                tx.run(
-                    """
-                    MATCH (dup:Entity {normalized_name: $dup_norm})
-                    MATCH (canon:Entity {normalized_name: $canon_norm})
-                    MATCH (dup)-[r:RELATES_TO]->(target)
-                    WHERE target <> canon
-                    MERGE (canon)-[new:RELATES_TO {
-                        predicate: r.predicate,
-                        source_id: r.source_id,
-                        extractor: r.extractor
-                    }]->(target)
-                    SET new.chunk_text = r.chunk_text,
-                        new.claim_span = r.claim_span,
-                        new.source_file = r.source_file,
-                        new.chunk_index = r.chunk_index,
-                        new.predicate_embedding = r.predicate_embedding
-                    """,
-                    dup_norm=duplicate_normalized,
-                    canon_norm=canonical_name.lower().strip(),
-                )
-                # Copy incoming relationships to canonical
-                tx.run(
-                    """
-                    MATCH (dup:Entity {normalized_name: $dup_norm})
-                    MATCH (canon:Entity {normalized_name: $canon_norm})
-                    MATCH (source)-[r:RELATES_TO]->(dup)
-                    WHERE source <> canon
-                    MERGE (source)-[new:RELATES_TO {
-                        predicate: r.predicate,
-                        source_id: r.source_id,
-                        extractor: r.extractor
-                    }]->(canon)
-                    SET new.chunk_text = r.chunk_text,
-                        new.claim_span = r.claim_span,
-                        new.source_file = r.source_file,
-                        new.chunk_index = r.chunk_index,
-                        new.predicate_embedding = r.predicate_embedding
-                    """,
-                    dup_norm=duplicate_normalized,
-                    canon_norm=canonical_name.lower().strip(),
-                )
-                # Delete duplicate and its edges
-                tx.run(
-                    "MATCH (dup:Entity {normalized_name: $dup_norm}) DETACH DELETE dup",
-                    dup_norm=duplicate_normalized,
-                )
+        raise RuntimeError(
+            "merge_entity_into_canonical e' legacy e incompatibile con lo "
+            "schema a tipi dinamici (predicato = tipo dell'arco): la "
+            "canonicalizzazione va fatta PRIMA della scrittura "
+            "(entity_canonicalizer.py). I grafi vecchi vanno rigenerati."
+        )
 
     # ────────────────────────────────────────────────────────────────
     # Attribution queries
@@ -422,7 +401,7 @@ class Neo4jClient:
             result = s.run(
                 """
                 MATCH (sub:Entity {normalized_name: $s_norm})
-                      -[r:RELATES_TO]->
+                      -[r]->
                       (obj:Entity {normalized_name: $o_norm})
                 WHERE toLower(r.predicate) = $p_norm
                   AND ($ext IS NULL OR r.extractor = $ext)
@@ -462,7 +441,7 @@ class Neo4jClient:
             result = s.run(
                 """
                 MATCH (sub:Entity {normalized_name: $s_norm})
-                      -[r:RELATES_TO]->
+                      -[r]->
                       (obj:Entity {normalized_name: $o_norm})
                 WHERE $ext IS NULL OR r.extractor = $ext
                 RETURN r.predicate AS predicate,
@@ -518,7 +497,7 @@ class Neo4jClient:
         o_norm = obj.lower().strip() if obj else None
 
         cypher = """
-        MATCH (sub:Entity)-[r:RELATES_TO]->(obj:Entity)
+        MATCH (sub:Entity)-[r]->(obj:Entity)
         WHERE ($s_norm IS NULL OR sub.normalized_name = $s_norm)
           AND ($o_norm IS NULL OR obj.normalized_name = $o_norm)
           AND ($ext IS NULL OR r.extractor = $ext)
@@ -587,7 +566,7 @@ class Neo4jClient:
         with self._session() as s:
             r = s.run(
                 "MATCH (n:Entity) WITH count(n) AS nodes "
-                "MATCH ()-[r:RELATES_TO]->() "
+                "OPTIONAL MATCH (:Entity)-[r]->(:Entity) "
                 "RETURN nodes, count(r) AS relations"
             )
             rec = r.single()
@@ -600,7 +579,7 @@ class Neo4jClient:
         with self._session() as s:
             result = s.run(
                 """
-                MATCH ()-[r:RELATES_TO]->()
+                MATCH (:Entity)-[r]->(:Entity)
                 RETURN coalesce(r.extractor, '(none)') AS extractor,
                        count(r) AS relations,
                        count(DISTINCT r.source_id) AS sources

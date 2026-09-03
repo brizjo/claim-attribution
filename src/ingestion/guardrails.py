@@ -6,29 +6,50 @@ lavora frase per frase, quindi la frase è nota: `claim_span` non viene più
 chiesto al modello ma assegnato dalla pipeline, e i guardrail verificano la
 tripla CONTRO quella frase.
 
-Regole, nell'ordine di applicazione (la prima che fallisce vince):
+Regole, nell'ordine di applicazione (la prima che fallisce vince).
+Tarate il 2026-09-03 sui falsi positivi del primo run reale (v. lessons.md):
 
-  1. `no_predicate`          predicato vuoto o solo stopword ("is a", "of").
+  1. `no_predicate`          predicato VUOTO.  Le copule ("was", "has") NON
+                             si scartano più: reggono fatti classificatori
+                             legittimi (Bican | was | footballer).
   2. `unresolved_reference`  S oppure O contiene un riferimento deittico
                              irrisolto: pronome ("he", "it"), o sintagma
                              "that same year" / "that game" / "the subsequent
                              game".  Sono nodi che non identificano nulla
                              fuori dalla frase — e la coref non li risolve.
-  3. `generic_node`          S oppure O è un sostantivo comune non ancorato
-                             ("game", "teams", "players"): niente entità
-                             nominata (NER), niente PROPN, niente numero/data.
-                             Sono i nodi-calamita che collezionano archi da
-                             fatti diversi: falsi positivi strutturali.
+  3. `generic_node`          il SOGGETTO è un sostantivo comune non ancorato
+                             ("game", "teams", "match"): niente entità
+                             nominata (NER), niente PROPN, niente numero/data,
+                             e nemmeno nel titolo.  Sono i nodi-calamita che
+                             collezionano archi da fatti diversi.  L'OGGETTO
+                             generico è ammesso: "played as | striker" con
+                             soggetto ancorato è un fatto verificabile.
   4. `empty_subject` / `empty_object`
                              vuoto o senza content token.
   5. `subject_equals_object` tautologia.
-  6. `span_not_verbatim`     lo span non compare nel passaggio originale.
-  7. `entity_not_in_sentence`
-                             S oppure O non compare nella frase sorgente
-                             (match normalizzato + fuzzy leggero su morfologia
-                             e possessivi).  Becca le triple inferite da
-                             conoscenza pregressa invece che dal testo.
-  8. `subject_is_claim` / `object_is_claim`
+  6. `prepositional_object`  l'OGGETTO inizia con una preposizione ("in
+                             Ireland", "on 25 September"): la preposizione fa
+                             parte del PREDICATO, non del nodo.  Lasciarla
+                             passare crea un nodo distinto per ogni forma
+                             preposizionale della stessa entità ("in Ireland"
+                             non si unifica mai con "Republic of Ireland":
+                             nessuno dei 4 stadi di canonicalizzazione lo
+                             risolve, cf. `tasks/issues_canonicalizzazione.md`).
+  7. `span_not_verbatim`     lo span non compare nel passaggio originale.
+  8. `entity_not_in_sentence`
+                             S oppure O non compare né nella frase sorgente
+                             né nel TITOLO del passaggio (match normalizzato
+                             + fuzzy leggero).  Il titolo è contesto lecito:
+                             sta nel prompt, e il modello lo usa — giustamente
+                             — come nome canonico dell'entità principale.
+  9. `conjunction_mention`   S o O coordina DUE entità nominate distinte
+                             ("Fianna Fail and Fine Gael"): non è un nodo, sono
+                             due.  Va scisso in due triple con lo stesso
+                             predicato — lo chiede il prompt, qui si verifica.
+                             Un nome proprio che contiene "and" ("Trinidad and
+                             Tobago") NON è una coordinazione: lo distingue la
+                             NER, che lo riconosce come entità unica.
+ 10. `subject_is_claim` / `object_is_claim`
                              S o O copre quasi tutta la frase: non è
                              un'entità, è la frase stessa.
 
@@ -70,8 +91,10 @@ REASONS = (
     "empty_subject",
     "empty_object",
     "subject_equals_object",
+    "prepositional_object",
     "span_not_verbatim",
     "entity_not_in_sentence",
+    "conjunction_mention",
     "subject_is_claim",
     "object_is_claim",
     "duplicate",
@@ -165,6 +188,81 @@ def is_deictic(entity: str) -> bool:
     )
 
 
+# ── Oggetto preposizionale ───────────────────────────────────────────
+
+# La preposizione appartiene al PREDICATO, non al nodo: "in Ireland" e
+# "Republic of Ireland" sono la stessa entita' ma restano due nodi, perche'
+# lo stadio 2 della canonicalizzazione lavora per contenimento di token e
+# `in` non compare nella forma lunga.  Fermarla qui e' piu' economico che
+# recuperarla dopo.
+_LEADING_PREPOSITION = re.compile(
+    r"^(?:in|on|at|of|to|from|by|for|with|as|into|onto|upon|over|under|"
+    r"after|before|during|since|until|till|within|without|between|among|"
+    r"amongst|through|throughout|across|against|about|around|near|beside|"
+    r"behind|beyond|per|via)\b\s+",
+    re.IGNORECASE,
+)
+
+
+def has_leading_preposition(entity: str) -> bool:
+    """True se la menzione inizia con una preposizione seguita da altro testo."""
+    text = _norm_ws(entity)
+    if not text:
+        return False
+    stripped = _LEADING_PREPOSITION.sub("", text).strip()
+    # "Of Mice and Men" senza seguito utile non e' un oggetto preposizionale.
+    return bool(stripped) and stripped != text
+
+
+# ── Coordinazione di entita' ─────────────────────────────────────────
+
+# Una coordinazione richiede una congiunzione ESPLICITA (`and` / `&`).
+# `or` NON e' incluso: una disgiunzione ("either of the two main parties")
+# e' gia' fermata da `generic_node`, e splittarla produrrebbe due fatti che
+# il passaggio non afferma.
+_CONJUNCTION = re.compile(r"\s+and\s+|\s*&\s*", re.IGNORECASE)
+# La virgola separa solo DENTRO una coordinazione gia' accertata ("X, Y and
+# Z").  Da sola non basta: "January 9, 2007" e "Bican, a striker" sono una
+# data e un'apposizione, non due entita' coordinate — splittarle a vista
+# bocciava triple legittime (visto in test).
+_COORD_SPLIT = re.compile(r"\s+and\s+|\s*&\s*|,\s+", re.IGNORECASE)
+
+
+def is_coordination(
+    entity: str,
+    sentence: str,
+    anchorer: "EntityAnchorer",
+    title: str = "",
+) -> bool:
+    """
+    True se la menzione coordina DUE o piu' entita' nominate distinte.
+
+    Il discrimine NON e' la stringa ma la NER: "Procter and Gamble" e
+    "Bosnia and Herzegovina" contengono `and` e spaCy li riconosce come UNA
+    entita' della frase, quindi non sono coordinazioni.  "Fianna Fail and
+    Fine Gael" invece produce due entita' separate, entrambe ancorate.
+
+    Secondo segnale, gratuito: il TITOLO del passaggio.  `en_core_web_sm`
+    sbaglia su alcuni toponimi congiuntivi ("Trinidad and Tobago" esce come
+    due GPE), ma se la menzione compare VERBATIM nel titolo Wikipedia allora
+    e' un nome, non una coordinazione.  Limite residuo noto: quando ne' la
+    NER ne' il titolo coprono il caso, un nome proprio con `and` viene
+    bocciato.  E' la direzione di errore voluta — meno triple ma piu'
+    precise — e il round di repair ha comunque una seconda chance.
+    """
+    text = _norm_ws(entity)
+    if not text or not _CONJUNCTION.search(text):
+        return False
+    parts = [p.strip() for p in _COORD_SPLIT.split(text) if p.strip()]
+    if len(parts) < 2:
+        return False
+    if anchorer.is_single_entity(text, sentence):
+        return False
+    if title and _fold(text) in _fold(_norm_ws(title)):
+        return False
+    return sum(1 for p in parts if anchorer.is_anchored(p, sentence)) >= 2
+
+
 # ── Ancoraggio dell'entità: NER / POS sulla frase ────────────────────
 
 _HAS_DIGIT = re.compile(r"\d")
@@ -200,8 +298,14 @@ class EntityAnchorer:
         return self._nlp
 
     @lru_cache(maxsize=4096)
-    def _analyse(self, sentence: str) -> tuple[frozenset, frozenset]:
-        """`(token ancorati, token di named entity)` della frase, foldati."""
+    def _analyse(self, sentence: str) -> tuple[frozenset, frozenset, frozenset]:
+        """
+        `(token ancorati, token di named entity, entita' INTERE)` della frase.
+
+        Le entita' intere servono a `is_single_entity`: "Trinidad and Tobago"
+        e' un solo nodo, non una coordinazione, e la sola cosa che lo sa e'
+        la NER — a livello di token e' indistinguibile da "Alpha and Beta".
+        """
         with self._lock:
             doc = self._get_nlp()(sentence)
         anchored = {
@@ -211,7 +315,8 @@ class EntityAnchorer:
         ent_tokens = {
             _fold(tok.text) for ent in doc.ents for tok in ent
         }
-        return frozenset(anchored), frozenset(ent_tokens)
+        ent_spans = {_norm_ws(_fold(ent.text)) for ent in doc.ents}
+        return frozenset(anchored), frozenset(ent_tokens), frozenset(ent_spans)
 
     def is_anchored(self, entity: str, sentence: str) -> bool:
         text = _norm_ws(entity)
@@ -219,11 +324,19 @@ class EntityAnchorer:
             return False
         if _HAS_DIGIT.search(text):
             return True
-        anchored, ent_tokens = self._analyse(sentence)
+        anchored, ent_tokens, _ = self._analyse(sentence)
         tokens = {t for t in _fuzzy_tokens(text) if t not in _STOP_FOLDED}
         if not tokens:
             return False
         return any(tok in anchored or tok in ent_tokens for tok in tokens)
+
+    def is_single_entity(self, entity: str, sentence: str) -> bool:
+        """La menzione coincide con UNA named entity intera della frase."""
+        text = _norm_ws(_fold(entity))
+        if not text:
+            return False
+        _, _, ent_spans = self._analyse(sentence)
+        return text in ent_spans
 
 
 _DEFAULT_ANCHORER: Optional[EntityAnchorer] = None
@@ -258,18 +371,29 @@ def check(
     claim_span: str = "",
     original_text: str = "",
     anchorer: Optional[EntityAnchorer] = None,
+    title: str = "",
 ) -> Verdict:
     """
     Valuta una tripla contro la sua frase sorgente.
 
-    `sentence` è la frase (coref-risolta) data all'estrattore: è lì che S e O
-    devono comparire.  `claim_span` è la frase corrispondente sul testo
-    ORIGINALE, salvata come evidenza verbatim; se `original_text` è passato si
+    `sentence` è la frase (coref-risolta) data all'estrattore.  `title` è il
+    titolo del passaggio: fa parte del prompt, quindi è CONTESTO LECITO — il
+    modello risolve correttamente "The iPhone" nel titolo "iPhone (1st
+    generation)" e non va punito per questo.  `claim_span` è la frase
+    corrispondente sul testo ORIGINALE; se `original_text` è passato si
     verifica che vi compaia davvero.
+
+    Tarature del 2026-09-03 (sui falsi positivi del primo run reale):
+      * `no_predicate` solo per predicato VUOTO: le copule ("was", "has")
+        reggono fatti classificatori legittimi (Bican | was | footballer) —
+        l'asserzione sta nella coppia copula + oggetto descrittivo.
+      * `generic_node` solo sul SOGGETTO: è il soggetto non identificante a
+        creare i nodi-calamita ("team", "match"); un oggetto descrittivo con
+        soggetto ancorato (played as | striker) è un fatto verificabile.
     """
     anchorer = anchorer or default_anchorer()
 
-    if not content_tokens(predicate):
+    if not _norm_ws(predicate):
         return Verdict(False, "no_predicate")
 
     for field in (subject, obj):
@@ -283,16 +407,28 @@ def check(
     if content_tokens(subject) == content_tokens(obj):
         return Verdict(False, "subject_equals_object")
 
+    # Solo sull'OGGETTO: un soggetto che inizia con una preposizione e' un
+    # caso diverso (frase mal segmentata) e cade su `generic_node` o
+    # `subject_is_claim`, con un motivo piu' informativo per il repair.
+    if has_leading_preposition(obj):
+        return Verdict(False, "prepositional_object")
+
     if claim_span and original_text and \
             _norm_ws(claim_span) not in _norm_ws(original_text):
         return Verdict(False, "span_not_verbatim")
 
-    if not in_sentence(subject, sentence) or not in_sentence(obj, sentence):
+    context = f"{sentence} {title}".strip()
+    if not in_sentence(subject, context) or not in_sentence(obj, context):
         return Verdict(False, "entity_not_in_sentence")
 
+    # Dopo i check lessicali: la coordinazione costa una analisi spaCy.
     for field in (subject, obj):
-        if not anchorer.is_anchored(field, sentence):
-            return Verdict(False, "generic_node")
+        if is_coordination(field, sentence, anchorer, title):
+            return Verdict(False, "conjunction_mention")
+
+    if not anchorer.is_anchored(subject, sentence) and \
+            not (title and in_sentence(subject, title)):
+        return Verdict(False, "generic_node")
 
     if _coverage(subject, sentence) >= CLAIM_COVERAGE:
         return Verdict(False, "subject_is_claim")

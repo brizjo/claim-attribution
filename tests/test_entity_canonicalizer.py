@@ -207,6 +207,87 @@ def test_stage2_does_not_merge_on_a_bare_number():
     assert len({r.canonical for r in resolutions.values()}) == 2
 
 
+# ── Anti-valanga (caso reale iPhone, 2026-09-03) ──────────────────────
+
+def test_containment_requires_head_token():
+    """"Apple" NON e' "Apple iPhone" ne' "History of Apple Inc": senza il
+    vincolo sulla testa l'union-find fondeva Apple, iPhone e History of
+    Apple Inc in un nodo solo (valanga osservata sul corpus reale)."""
+    from src.ingestion.entity_canonicalizer import (
+        is_title_containment,
+        is_token_containment,
+    )
+    # Testa inclusa -> merge legittimo.
+    assert is_token_containment("VanDeWeghe", "Kiki VanDeWeghe")
+    assert is_token_containment("iPhone", "Apple iPhone")
+    # Modificatore condiviso -> MAI merge.
+    assert not is_token_containment("Apple", "Apple iPhone")
+    assert not is_token_containment("Apple", "History of Apple Inc")
+    # Limite noto: "iPhone" ⊂ "History of iPhone" passa (la testa combacia);
+    # nel linker l'ambiguita' fra piu' titoli con la stessa testa lo
+    # neutralizza (astensione), e come menzione i titoli-meta non compaiono.
+    assert is_token_containment("iPhone", "History of iPhone")
+    # Una frase descrittiva (7+ token) non e' un nome: niente merge anche
+    # se la testa combacia.
+    assert not is_token_containment(
+        "Apple Inc",
+        "first smartphone model designed and marketed by Apple Inc")
+    # Linker su titolo: prefisso ammesso ("Louise" primo nome)...
+    assert is_title_containment("Louise", "Louise Brown")
+    # ...ma i titoli META non linkano mai per containment: "History of
+    # Apple Inc." parla di Apple, non E' Apple.
+    assert not is_title_containment("Apple", "History of Apple Inc")
+    assert not is_title_containment("Apple Inc", "History of Apple Inc")
+
+
+def test_stage1_strips_leading_preposition():
+    """"in Ireland" e "Republic of Ireland" sono la stessa entita', ma con la
+    preposizione attaccata NESSUNO dei 4 stadi le unifica: containment
+    fallisce (`in` non e' nella forma lunga), lessicale 0.62, coseno 0.65,
+    soglie a 0.90.  Lo strip la riporta allo stadio 2, deterministico."""
+    assert normalize_mention("in Ireland") == "Ireland"
+    assert normalize_mention("in 2011") == "2011"
+    # Le teste si accumulano: si rimuovono in ciclo.
+    assert normalize_mention("in the country") == "country"
+    assert normalize_mention("in Ireland") == normalize_mention("in Ireland")
+
+    canon = canonicalizer()
+    resolutions = resolve(canon, [
+        mention("in Ireland"), mention("Republic of Ireland"),
+    ])
+    assert {r.canonical for r in resolutions.values()} == {"Republic of Ireland"}
+
+
+def test_containment_never_crosses_a_conjunction():
+    """"Fine Gael" ⊂ "Fianna Fail and Fine Gael" passava il vincolo sulla
+    testa (`gael` e' l'ultimo token) e il partito veniva assorbito dal blob
+    dei due partiti, mentre "Fianna Fail" no: spariva solo chi stava in coda
+    alla congiunzione.  Caso reale, campione Irlanda."""
+    assert not is_token_containment("Fine Gael", "Fianna Fail and Fine Gael")
+    assert not is_token_containment("Fianna Fail", "Fianna Fail and Fine Gael")
+
+    canon = canonicalizer()
+    resolutions = resolve(canon, [
+        mention("Fine Gael"), mention("Fianna Fail and Fine Gael"),
+    ])
+    assert len({r.canonical for r in resolutions.values()}) == 2
+
+
+def test_containment_requires_a_proper_name():
+    """Il vincolo sulla testa non distingue un cognome da un sostantivo
+    comune: fondeva `seats` ⊂ `20 seats` e `government` ⊂ `coalition
+    government`, e faceva di un'elezione l'esito di un'elezione.  Il proxy
+    deterministico e' la maiuscola (lo stadio 2 non usa spaCy)."""
+    assert not is_token_containment("seats", "20 seats")
+    assert not is_token_containment("government", "coalition government")
+    assert not is_token_containment(
+        "recent general election", "outcome of the recent general election")
+    # I nomi propri continuano a fondersi.
+    assert is_token_containment("Ireland", "Republic of Ireland")
+    assert is_token_containment("VanDeWeghe", "Kiki VanDeWeghe")
+    assert is_token_containment("iPhone", "Apple iPhone")
+
+
 # ── Stadio 3: entity linking ──────────────────────────────────────────
 
 def test_stage3_title_linker_unifies_without_threshold():
@@ -220,6 +301,22 @@ def test_stage3_title_linker_unifies_without_threshold():
     assert {r.canonical for r in resolutions.values()} == {"Josef Bican"}
     assert {r.external_id for r in resolutions.values()} == {"wikipedia:Josef Bican"}
     assert resolutions["Bican"].stage == STAGE_LINKING
+
+
+def test_stage3_external_id_keeps_the_disambiguator():
+    """L'ID esterno deve DISCRIMINARE, l'etichetta deve essere LEGGIBILE.
+
+    Normalizzare il titolo dentro l'ID buttava "(Ireland)", cioe' l'unica
+    cosa che distingue il Labour Party irlandese da quello britannico: con
+    `scope=global` i due collassavano senza nessun segnale."""
+    canon = canonicalizer(linker=TitleLinker())
+    resolutions = resolve(canon, [
+        mention("Labour Party", source_id="d0", title="Labour Party (Ireland)"),
+    ])
+    resolution = resolutions["Labour Party"]
+    assert resolution.external_id == "wikipedia:Labour Party (Ireland)"
+    # ...ma il nome sul nodo resta la forma normalizzata.
+    assert resolution.canonical == "Labour Party"
 
 
 def test_stage3_ambiguous_title_does_not_link():

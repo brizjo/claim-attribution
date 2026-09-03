@@ -2,7 +2,7 @@
 Registro dei documenti già processati, per estrattore.
 
 Perché esiste: il check di idempotenza su Neo4j
-(`MATCH ()-[r:RELATES_TO {source_id, extractor}]->()`) non vede i documenti
+(`MATCH (:Entity)-[r]->(:Entity) WHERE r.source_id/...`) non vede i documenti
 che hanno prodotto ZERO triple — non lasciano archi, quindi verrebbero
 riestratti a ogni run (e l'estrazione è la parte costosa).
 

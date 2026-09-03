@@ -59,6 +59,13 @@ def get_debug_coref_resolver():
 
 
 @st.cache_resource
+def get_generator():
+    """Generatore grounded (studio <claim, context>, stadio 1) — client caldo."""
+    from src.generation.answer_generator import AnswerGenerator
+    return AnswerGenerator()
+
+
+@st.cache_resource
 def get_graph_writer():
     """One GraphWriter — keeps its SentenceTransformer loaded across writes."""
     from src.ingestion.graph_writer import GraphWriter

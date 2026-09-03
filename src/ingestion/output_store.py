@@ -11,6 +11,8 @@ Produced files (under settings.OUTPUT_DIR):
     triples_extracted.jsonl     each (S, P, O) + claim_span + source_id
     triples_discarded.jsonl     triple bocciate dai guardrail della pipeline
                                 principale (+ discard_reason, stage)
+    generated_answers.jsonl     risposte del generatore grounded (domanda,
+                                risposta, modello, source_id dei passaggi)
     attribution_results.jsonl   claim attribution outcomes
     ingest_reports.jsonl        per-question ingestion summaries
     canonicalization.jsonl      una riga per menzione: forma originale -> forma
@@ -179,6 +181,34 @@ def save_ingest_report(
         "docs_skipped": docs_skipped,
         "zero_triple_docs": zero_triple_docs,
         "errors": errors,
+        "timestamp": _timestamp(),
+    })
+
+
+def save_generated_answer(
+    sample_id: str,
+    question: str,
+    answer: str,
+    model: str,
+    seconds: float,
+    passages: list[dict],
+) -> None:
+    """
+    Persiste una risposta del generatore grounded (studio <claim, context>,
+    stadio 1).  Dei passaggi si salvano source_id e title: il testo integrale
+    e' recuperabile dal corpus per source_id e sta gia' in coref_resolved.jsonl.
+    """
+    _append(_BASE / "generated_answers.jsonl", {
+        "sample_id": sample_id,
+        "question": question,
+        "answer": answer,
+        "model": model,
+        "seconds": round(seconds, 3),
+        "passages": [
+            {"source_id": p.get("source_id", ""),
+             "title": p.get("title", p.get("source_file", ""))}
+            for p in passages
+        ],
         "timestamp": _timestamp(),
     })
 

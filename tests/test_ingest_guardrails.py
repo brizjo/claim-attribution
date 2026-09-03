@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.ingestion import output_store
+from src.ingestion import guardrails, output_store
 from src.ingestion.alce_ingestor import AlceIngestor
 from src.ingestion.coref_resolver import CorefUnavailable
 from src.ingestion.triple_extractor import Triple
@@ -27,10 +27,16 @@ from src.ingestion.triple_extractor import Triple
 class StubAnchorer:
     """Tutto ancorato tranne i sostantivi generici designati."""
 
-    GENERIC = {"game", "teams", "players"}
+    GENERIC = {"game", "teams", "players", "striker"}
+    # Nomi propri che CONTENGONO "and" ma sono una sola entita': con lo
+    # spaCy vero lo dice la NER, qui va dichiarato.
+    SINGLE_ENTITIES = {"trinidad and tobago", "procter and gamble"}
 
     def is_anchored(self, entity: str, sentence: str) -> bool:
         return entity.lower().strip() not in self.GENERIC
+
+    def is_single_entity(self, entity: str, sentence: str) -> bool:
+        return entity.lower().strip() in self.SINGLE_ENTITIES
 
 
 class StubResolver:
@@ -173,6 +179,111 @@ def test_generic_node_discarded():
     assert [(t.subject, t.obj) for t in result.triples] == \
         [("Barack Obama", "Honolulu")]
     assert [r["discard_reason"] for r in result.discarded] == ["generic_node"]
+
+
+def test_title_is_legitimate_context():
+    """Il modello risolve "The iPhone" col titolo "iPhone (1st generation)":
+    non va scartato per entity_not_in_sentence (caso reale, 7 triple perse)."""
+    sentence = "The iPhone was officially announced on January 9, 2007."
+    chunk = {"source_id": "14664751", "title": "iPhone (1st generation)",
+             "text": sentence, "chunk_index": 0}
+    extractor = StubExtractor(
+        {sentence: [("iPhone (1st generation)", "announced on",
+                     "January 9, 2007")]})
+    result = make_ingestor(extractor).extract_doc(chunk)
+
+    assert len(result.triples) == 1
+    assert result.discarded == []
+
+
+def test_copula_predicate_kept():
+    """"Bican | was | footballer" e' un fatto classificatorio legittimo:
+    no_predicate scatta solo su predicato VUOTO (caso reale)."""
+    sentence = "Josef Bican was a Czech-Austrian professional footballer."
+    chunk = {**CHUNK, "text": sentence}
+    extractor = StubExtractor(
+        {sentence: [("Josef Bican", "was",
+                     "Czech-Austrian professional footballer")]})
+    result = make_ingestor(extractor).extract_doc(chunk)
+
+    assert len(result.triples) == 1
+    assert result.discarded == []
+
+
+def test_generic_object_kept_generic_subject_discarded():
+    """generic_node solo sul SOGGETTO: "played as | striker" sopravvive,
+    il soggetto-calamita "game" muore (casi reali)."""
+    sentence = "Josef Bican watched the game and played as a striker."
+    chunk = {**CHUNK, "text": sentence}
+    extractor = StubExtractor(
+        {sentence: [("Josef Bican", "played as", "striker"),
+                    ("game", "watched by", "Josef Bican")]})
+    result = make_ingestor(extractor).extract_doc(chunk)
+
+    assert [(t.subject, t.obj) for t in result.triples] == \
+        [("Josef Bican", "striker")]
+    assert [r["discard_reason"] for r in result.discarded] == ["generic_node"]
+
+
+def test_prepositional_object_discarded():
+    """La preposizione appartiene al PREDICATO, non al nodo.
+
+    "in Ireland" e "Republic of Ireland" sono la stessa entita' ma nessuno
+    dei 4 stadi di canonicalizzazione li unifica quando la preposizione resta
+    attaccata (containment fallisce, lessicale 0.62, coseno 0.65, soglie a
+    0.90).  Caso reale, campione Irlanda."""
+    sentence = "Fianna Fail was the largest party in Ireland until 2011."
+    chunk = {**CHUNK, "text": sentence}
+    extractor = StubExtractor(
+        {sentence: [("Fianna Fail", "largest party until 2011", "in Ireland")]})
+    result = make_ingestor(extractor).extract_doc(chunk)
+
+    assert result.triples == []
+    assert [r["discard_reason"] for r in result.discarded] == \
+        ["prepositional_object"]
+
+
+def test_conjunction_mention_discarded():
+    """"X and Y" e' DUE nodi, non uno.
+
+    Senza questo guardrail lo stadio 2 fondeva `Fine Gael` dentro
+    `Fianna Fail and Fine Gael` (la testa `gael` combacia) ma non
+    `Fianna Fail`: il partito in coda alla congiunzione spariva, quello in
+    testa no.  Caso reale, campione Irlanda."""
+    sentence = ("Fianna Fail and Fine Gael were on opposing sides of the "
+                "Irish Civil War.")
+    chunk = {**CHUNK, "text": sentence}
+    extractor = StubExtractor(
+        {sentence: [("Fianna Fail and Fine Gael", "were on opposing sides of",
+                     "Irish Civil War")]})
+    result = make_ingestor(extractor).extract_doc(chunk)
+
+    assert result.triples == []
+    assert [r["discard_reason"] for r in result.discarded] == \
+        ["conjunction_mention"]
+
+
+def test_proper_name_containing_and_is_not_a_conjunction():
+    """"Trinidad and Tobago" contiene `and` ma e' UN nodo: a distinguerlo e'
+    la NER, non la stringa."""
+    anchorer = StubAnchorer()
+    sentence = "Trinidad and Tobago qualified for the 2006 World Cup."
+    assert not guardrails.is_coordination(
+        "Trinidad and Tobago", sentence, anchorer)
+    assert guardrails.is_coordination(
+        "Fianna Fail and Fine Gael", sentence, anchorer)
+    # Il titolo e' il secondo segnale, per quando la NER sbaglia.
+    assert not guardrails.is_coordination(
+        "Alpha and Beta", sentence, anchorer,
+        title="Alpha and Beta national football team")
+
+
+def test_comma_alone_is_not_a_coordination():
+    """"January 9, 2007" e' una data, non due entita': senza congiunzione
+    esplicita non si splitta (regressione: bocciava triple legittime)."""
+    anchorer = StubAnchorer()
+    sentence = "The iPhone was officially announced on January 9, 2007."
+    assert not guardrails.is_coordination("January 9, 2007", sentence, anchorer)
 
 
 def test_coref_failure_does_not_kill_passage():

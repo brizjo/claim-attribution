@@ -77,7 +77,8 @@ La verifica di un claim segue una gerarchia di precisione:
 Un'LLM genererà la risposta partendo dai passaggi forniti da ALCE, il context dovrebbe essere già embeddato in un grafo (runTime o già presente nel DB) e i claim della risposta verranno estratti con la stessa tecnologia (DeepSeek) utilizzata per l'ingestione — la simmetria di estrazione è il requisito §4.
 
 La pipeline che si dovrebbe andare a creare per lo studio della coppia <claim, context> è la seguente:
-1. **Generazione del Generator con i passaggi forniti da ASQA** LLM genera la risposta assumendo di aver fornito i passaggi giusti dal corpus ALCE
+1. **Generazione del Generator con i passaggi forniti da ASQA** LLM genera la risposta assumendo di aver fornito i passaggi giusti dal corpus ALCE.
+   *Implementato (2026-09-03):* `src/generation/answer_generator.py` — DeepSeek con contratto di grounding rigido (SOLO i passaggi forniti, niente memoria di addestramento né fonti esterne; nomi completi mai pronomi, perché la risposta verrà scomposta in triple). Visibile nella UI, tab Claim Attribution (in futuro tutto in un'unica scheda): risposta in evidenza + passaggi integrali. Log in `data/outputs/generated_answers.jsonl`. Gli stadi 2-4 sono ancora futuri.
 2. **Claim Extraction** I claim vengono estratti dalla riposta generata (con DeepSeek, lo stesso estrattore dell'ingestione)
 3. **Claim Attribution** Verrà effettuata una ricerca all'interno del Context fornito per recuperare i passaggi pertinenti ai claim estratti (se esiste il predicato che unisce i due nodi allora il claim è supportato, altrimenti si controlla il feedback semantico, se anche questo non porta a nulla allora si scarta il claim).
 4. **Generazione della Risposta finale** Sulla base dei claim supportati, verrà generata la risposta finale.

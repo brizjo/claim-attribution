@@ -336,6 +336,75 @@ uccideva l'intero passaggio.
       allineato. Suite: 84 test passati (escluso `test_rag_rewardbench.py`,
       rotto dal primo commit: `BERTSCORE_MODEL` inesistente).
 
+## Phase 18: Generator DeepSeek grounded (studio <claim,context>, stadio 1) (2026-09-03)
+
+- [x] `src/generation/answer_generator.py` — `AnswerGenerator.generate(question,
+      passages)`: una chiamata DeepSeek (testo, NO json mode), prompt con
+      contratto di grounding (SOLO i passaggi, niente memoria/fonti esterne,
+      ambiguita' coperte, "non c'e' nei passaggi" esplicito, nomi completi mai
+      pronomi — la risposta verra' scomposta in triple). Errori sollevati, mai
+      risposta vuota silenziosa.
+- [x] `output_store.save_generated_answer` -> `generated_answers.jsonl`.
+- [x] `src/ui/resources.py`: `get_generator()` cached.
+- [x] UI tab Claim Attribution: sezione Generator in testa (poi tutto
+      confluira' in un'unica scheda) — selettore domanda, risposta ben
+      visibile (`.answer-box`), passaggi INTEGRALI sotto la risposta.
+- [x] `tests/test_answer_generator.py` — 4 test senza rete.
+
+### Futuro (dichiarato, NON in questo giro)
+- [ ] Passaggi (contesto) embeddati nel grafo con la pipeline di ingestione
+      (mancano ancora revisioni: embedding del predicato, altri controlli).
+- [ ] Claim extraction dalla risposta generata (DeepSeek, simmetria §4).
+- [ ] Inferenza dei claim nel grafo (exact -> semantic fallback) e risposta
+      finale dai soli claim supportati.
+- [ ] Unificazione UI in un'unica scheda generator+attribution.
+
+## Phase 19: Predicato come TIPO dell'arco (2026-09-03)
+
+Richiesta utente: nel Browser gli archi mostravano "RELATES_TO", predicato
+solo nelle property. Ora il TIPO dell'arco = predicato INTEGRALE
+(backtick-quoted: gli spazi sono ammessi, la vecchia assunzione era falsa).
+
+- [x] `Neo4jClient._rel_type` — escape del backtick, fallback RELATES_TO;
+      `_MERGE_TRIPLE` -> `_MERGE_TRIPLE_TEMPLATE` formattato per predicato.
+- [x] `predicate` resta come PROPERTY: exact match sulla property
+      (case-insensitive), fallback semantico sull'embedding — matching
+      invariato, il tipo e' solo presentazione.
+- [x] Tutte le query di lettura type-agnostiche: `(:Entity)-[r]->(:Entity)`
+      (l'ancora :Entity esclude i nodi Document). `stats` con OPTIONAL MATCH.
+- [x] Indice `rel_source_extractor` rimosso (per-tipo, non praticabile con
+      tipi dinamici): idempotenza a scan, ok a questa scala.
+- [x] `merge_entity_into_canonical` legacy: ora RuntimeError (avrebbe
+      ricreato archi RELATES_TO corrompendo lo schema).
+- [x] Grafo rigenerato (`--force` sulle 3 domande gia' processate): 151 archi,
+      114 nodi, tipi = predicati integrali verificati via `type(r)`,
+      property `predicate` presente su ogni arco, exact_match funzionante.
+
+## Phase 20: Taratura guardrail su falsi positivi reali + fix valanga canonicalizer (2026-09-03)
+
+Segnalazione utente: "il DB e' vuoto" (era il registry post-Clear Graph: serve
+`--force`) e "i guardrail eliminano triple sensate" (vero: 3 classi di falsi
+positivi lette da `triples_discarded.jsonl`).
+
+- [x] `entity_not_in_sentence`: il TITOLO del passaggio e' contesto lecito
+      (sta nel prompt) — match su frase+titolo. Recupera "iPhone (1st
+      generation) | announced on | January 9, 2007" & co.
+- [x] `generic_node` solo sul SOGGETTO: l'oggetto descrittivo con soggetto
+      ancorato ("played as | striker") e' un fatto verificabile; il
+      nodo-calamita e' il soggetto generico ("team", "match"), che muore.
+- [x] `no_predicate` solo su predicato VUOTO: le copule ("was | footballer")
+      reggono fatti classificatori legittimi.
+- [x] Effetto misurato (3 domande, 15 passaggi): 120 -> 151 triple tenute,
+      scarti 50 -> 25 (12 duplicate legittime; niente piu' no_predicate).
+- [x] BUG scoperto e fixato nel canonicalizer: valanga union-find dello
+      stadio 2 — "Apple"⊂"Apple iPhone"⊂... fondeva Apple, iPhone e "History
+      of Apple Inc" in un nodo. Fix: contenimento richiede la TESTA della
+      forma lunga; forme lunghe 7+ token = frasi, mai nomi; linker titolo
+      con prefisso ammesso ma titoli-meta ("History of X") esclusi.
+- [x] Test: +4 (3 tarature + anti-valanga), suite 85 passed.
+- [x] Grafo rigenerato e verificato: "first-generation iPhone" cluster
+      corretto, "History of Apple Inc" non inquina piu' i nodi.
+
 ## REBEL fuori dalla pipeline principale (2026-09-03)
 
 Estrattore unico: DeepSeek. REBEL resta solo negli esperimenti (il loro scopo
@@ -363,3 +432,57 @@ e' proprio misurare quanto aggiunge — vedi i numeri della fase ibrida sopra).
 ### Aperto
 - [ ] Il grafo scritto con `extractor="rebel"` non e' migrato: va rigenerato con
       DeepSeek (o interrogato di proposito con `ACTIVE_EXTRACTOR=rebel`).
+
+## Precisione dei nodi: prompt + guardrail + canonicalizzazione (2026-09-03)
+
+Diagnosi e numeri: `tasks/issues_canonicalizzazione.md`. Principio guida
+esplicito: **meno triple ma piu' precise** — lo stesso estrattore gira sui
+passaggi E sulla risposta generata, e un nodo che non nomina nulla non potra'
+mai essere agganciato dall'attribution.
+
+- [x] `deepseek_extractor.SYSTEM_PROMPT` riscritto: via "or noun phrases"
+      (licenziava `traditional centre ground`), risoluzione delle descrizioni
+      definite oltre ai pronomi, divieto di coordinazione, oggetto senza
+      preposizione iniziale, oggetto entita' e non proposizione. Esempi
+      generici (Alpha/Beta/Ruritania), mai casi del corpus.
+- [x] `guardrails.prepositional_object` — l'oggetto non inizia con una
+      preposizione: la preposizione va nel predicato.
+- [x] `guardrails.conjunction_mention` — "X and Y" e' due nodi. Discrimine via
+      NER (`EntityAnchorer.is_single_entity`, nuovo) + titolo come secondo
+      segnale. Richiede congiunzione ESPLICITA: la virgola da sola spezzava
+      `January 9, 2007`.
+- [x] `triple_repair.REASON_HINTS` + `REPAIR_SYSTEM_PROMPT`: le due reason
+      nuove diventano correzioni di secondo giro senza logica aggiuntiva.
+- [x] `normalize_mention`: strip in ciclo di articoli E preposizioni iniziali
+      ("in the country" -> "country"). Costo accettato e documentato: i titoli
+      che iniziano con preposizione perdono la testa ("Of Mice and Men" ->
+      "Mice and Men") — e' una CHIAVE di identita', la menzione verbatim resta
+      su `subject_surface`/`object_surface`.
+- [x] `is_token_containment`: mai attraversare una congiunzione; forma corta
+      con almeno una maiuscola (proxy deterministico di nome proprio).
+- [x] `TitleLinker` / `_external_label`: ID esterno sul titolo integrale
+      (`wikipedia:Labour Party (Ireland)`), etichetta del nodo normalizzata
+      (`Labour Party`).
+- [x] UI: `_render_neo4j_browser_commands` — dopo ogni scrittura stampa le
+      query Cypher filtrate sui `source_id` del contesto, piu' la sezione di
+      manutenzione (pulizia nodi orfani, coerenza nodi/archi/passaggi).
+- [x] 8 test nuovi (93 passati). Verifica sulle 61 menzioni reali del campione
+      Irlanda: `in Ireland` -> `Republic of Ireland`; `Fine Gael`, `seats` e
+      `government` tornano nodi autonomi; `external_id` conserva `(Ireland)`.
+      Nodi 47 -> 50: quattro fusioni sbagliate annullate, una corretta aggiunta.
+
+### Aperto
+- [ ] **Re-ingestione necessaria.** Prompt e canonicalizzazione girano PRIMA
+      della scrittura: nessuna correzione e' retroattiva. Il grafo attuale (194
+      archi, 20 passaggi) va rigenerato con `Force re-write`, seguito dalla
+      query di pulizia dei nodi orfani.
+- [ ] Misurare il costo in resa del prompt piu' stretto: triple prima/dopo sui
+      5 passaggi Irlanda (baseline 50) e distribuzione delle reason in
+      `data/outputs/triples_discarded.jsonl`. Se la resa crolla, si sa quale
+      regola l'ha causato.
+- [ ] `generic_node` resta solo sul SOGGETTO (scelta deliberata: "played as |
+      striker" e' legittimo). Gli oggetti generici li ferma il prompt, non il
+      guardrail: verificare sul re-ingest che basti.
+- [ ] `tests/test_rag_rewardbench.py` non si raccoglie:
+      `settings.BERTSCORE_MODEL` non esiste. Rottura preesistente, estranea a
+      queste modifiche.

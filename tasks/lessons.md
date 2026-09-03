@@ -20,7 +20,7 @@
 - mREBEL ingest = MINIBATCH (size = `REBEL_BATCH_SIZE`), not per-chunk. Per-chunk wastes the batched forward pass; Document node still finalized once at end. Crash mid-file → already-written batches persist.
 - mREBEL generation MUST set `num_return_sequences=3` (matching `num_beams=3`) — default keeps only top hypothesis, losing 2/3 of candidate triples. Dedupe per chunk on (subject, predicate, object) lowercased.
 - mREBEL output emits special tokens WITHOUT surrounding whitespace (e.g. `tp_XX<triplet>` glued together). Parser must use regex `re.sub(r"(<[^>]+>)", r" \1 ", text)` to space-separate before `split()` — otherwise `<triplet>` is never matched as its own token and triple count collapses to ~0.
-- Store all RELATES_TO with predicate as property (not as relationship type) — Cypher type names can't have spaces
+- ~~Store all RELATES_TO with predicate as property (not as relationship type) — Cypher type names can't have spaces~~ SUPERSEDED (2026-09-03): backtick-quoted type names DO allow spaces; il tipo dell'arco e' ora il predicato integrale, la property `predicate` resta per il matching (vedi lesson "Predicato come TIPO dell'arco").
 - Same REBEL model for both ingestion and claim parsing (consistency requirement from regole_progetto.md §4)
 - Predicate embeddings stored as float array on relationship — cosine similarity computed in Python (relationship vector indexes require Neo4j 5.18+)
 - Neo4j multi-DB: server may host more than one database. `Neo4jClient` MUST be constructed with `database=...` (default `"neo4j"`, settable via `NEO4J_DATABASE` env). All sessions go through `_session()` so the DB is consistent. UI shows active DB name + list of visible DBs — if Browser shows different counts, pick the matching DB in Browser.
@@ -277,6 +277,65 @@
   `src/ui/resources.py`: due `@st.cache_resource` con lo stesso corpo ma in
   moduli diversi sono due cache diverse, cioe' REBEL caricato due volte.
 
+## Taratura guardrail sul primo run reale + valanga del canonicalizer (2026-09-03)
+
+- **"Non ha scritto nel DB" era il registry, non la scrittura.** DB a 0 nodi ma
+  report con 30 triple scritte senza errori: qualcuno aveva svuotato il grafo
+  DOPO, e i re-ingest successivi saltavano tutto perche' il registry li segnava
+  processati. E' la lesson di Fase 11 che si ripresenta: `Clear Graph` non
+  tocca `processed_ids.txt` — dopo uno svuotamento serve SEMPRE `--force`.
+- **Un guardrail si tara sui suoi falsi positivi REALI, non sull'intuizione.**
+  Lettura integrale di `triples_discarded.jsonl` del primo run: tre classi di
+  triple sensate uccise. (1) `entity_not_in_sentence` puniva il modello per
+  aver usato il TITOLO come nome canonico ("iPhone (1st generation)" quando la
+  frase dice "The iPhone") — ma il titolo sta nel prompt: e' contesto lecito,
+  ora entra nel pool di match. (2) `generic_node` uccideva oggetti descrittivi
+  ("played as | striker", "steered focus away from | tablet"): il nodo-calamita
+  e' il SOGGETTO generico ("team", "match"), l'oggetto generico con soggetto
+  ancorato e' un fatto verificabile — ora il check e' solo sul soggetto.
+  (3) `no_predicate` uccideva le copule ("Bican | was | footballer"): fatto
+  classificatorio legittimo, l'asserzione sta nella coppia copula+oggetto —
+  ora scatta solo su predicato VUOTO. Effetto misurato su 3 domande: 120 -> 151
+  triple tenute, scarti da ~50 a 25 (di cui 12 duplicati legittimi).
+- **`is_token_containment` a un token condiviso + union-find = valanga.**
+  "Apple" ⊂ "Apple iPhone" e "Apple" ⊂ "History of Apple Inc" (un token basta,
+  la transitivita' fa il resto) fondevano Apple, iPhone e History of Apple Inc
+  in UN nodo battezzato "History of Apple Inc" — grafo corrotto in silenzio.
+  Fix in tre regole: (a) il contenimento richiede la TESTA della forma lunga
+  ("VanDeWeghe" ⊂ "Kiki VanDeWeghe" si', "Apple" ⊂ "Apple iPhone" no); (b) una
+  forma lunga di 7+ token e' una frase descrittiva, mai un nome; (c) il linker
+  su titolo ammette anche il PREFISSO ("Louise" ⊂ "Louise Brown") ma MAI i
+  titoli-meta ("History of X", "List of X"): l'articolo parla dell'entita',
+  non la nomina. *Lezione: ogni regola di merge lessicale va pensata col
+  worst-case dell'union-find in testa — non "questi due si somigliano?" ma
+  "che cluster produce la chiusura transitiva di questa regola sul corpus?"*
+
+## Predicato come TIPO dell'arco (2026-09-03)
+
+- **La vecchia lesson "i tipi Cypher non possono avere spazi" era FALSA**: i
+  tipi (e le label) backtick-quoted ammettono spazi e unicode —
+  `` MERGE (a)-[:`born in`]->(b) `` e' Cypher valido da sempre. Il tipo non
+  e' parametrizzabile (`$param`), quindi va interpolato nel testo della query:
+  l'unico escape necessario e' raddoppiare il backtick
+  (`Neo4jClient._rel_type`). Nel Browser l'arco ora mostra "born in", non
+  RELATES_TO.
+- **Il tipo e' presentazione, la property e' la chiave logica.** `predicate`
+  resta come property sull'arco: exact match case-insensitive sulla property
+  (`toLower(r.predicate)`), fallback semantico sull'embedding — il matching
+  non tocca `type(r)`. Doppia rappresentazione intenzionale: leggibilita' in
+  Browser + logica invariata.
+- **Con i tipi dinamici TUTTE le query di lettura devono diventare
+  type-agnostiche**: `-[r:RELATES_TO]->` matcha zero archi sul grafo nuovo
+  (fallimento SILENZIOSO: zero risultati, nessun errore). Sostituito ovunque
+  con `(:Entity)-[r]->(:Entity)` — l'ancora sulle label tiene fuori i nodi
+  Document. Grep di `RELATES_TO` su tutto src/ per non lasciarne uno.
+- **Costi accettati**: (1) l'indice `rel_source_extractor` era per-tipo e non
+  e' praticabile su tipi dinamici — i check di idempotenza degradano a scan,
+  ok alla scala del corpus; (2) `merge_entity_into_canonical` (legacy)
+  ricreerebbe archi RELATES_TO mescolando i due schemi: ora alza RuntimeError
+  invece di corrompere in silenzio; (3) il grafo scritto con lo schema vecchio
+  va RIGENERATO (`clear_graph` + `--force`), non migrato.
+
 ## Fase 17 — Guardrail in pipeline + repair + Neo4j batch (2026-09-03)
 
 - **I guardrail erano solo negli esperimenti: la pipeline principale scriveva
@@ -344,3 +403,68 @@
   pieno e zero risultati. Cambiato in `deepseek` in `.env` e `.env.example`.
   L'etichetta `EXTRACTOR_REBEL` resta in settings: i grafi vecchi restano
   interrogabili puntando `ACTIVE_EXTRACTOR=rebel` di proposito.
+
+## Precisione dei nodi: prompt + guardrail + canonicalizzazione (2026-09-03)
+
+Diagnosi completa e numeri in `tasks/issues_canonicalizzazione.md`.
+
+- **La soglia non era il problema: misurarlo ha evitato la correzione
+  sbagliata.** `in Ireland` e `Republic of Ireland` non si unificavano, e
+  l'istinto era abbassare `ENTITY_CLUSTER_THRESHOLD`. L'ablazione sulle 61
+  menzioni reali del campione Irlanda dice il contrario: la coppia sta a 0.645,
+  ma gia' a 0.70 `Pat Rabbitte` (una persona) finisce dentro `Labour Party` e
+  `Progressive Democrats` collassa su `Social Democrats`. E cio' che si voleva
+  ottenere non arriva comunque: `the country` sta a 0.533 e `the state` a 0.385
+  da `Republic of Ireland`. **Nessuna soglia toccata.**
+- **Le fusioni SBAGLIATE erano piu' gravi di quella mancata.** Una fusione
+  mancata costa recall e resta ispezionabile; una fusione sbagliata scrive un
+  fatto falso nel grafo. `Fine Gael` era diventato un alias di `Fianna Fail and
+  Fine Gael` perche' `is_token_containment` chiede la TESTA della forma lunga e
+  `gael` e' l'ultimo token della congiunzione — mentre `Fianna Fail`, in testa,
+  restava separato. Asimmetria pura: spariva solo chi finiva in coda.
+- **Il vincolo sulla testa non distingue un cognome da un sostantivo comune.**
+  Da qui `seats` ⊂ `20 seats`, `government` ⊂ `coalition government` e
+  `recent general election` ⊂ `outcome of the recent general election` (un
+  evento non e' il suo esito). Proxy scelto: la maiuscola nella forma corta —
+  deterministico, senza spaCy, perche' **lo stadio 2 deve restare
+  deterministico**. Risolve tutti i casi osservati senza toccare i legittimi.
+- **La preposizione appartiene al predicato, non al nodo.** Con `in` attaccato
+  la menzione e' irrecuperabile da tutti e 4 gli stadi. Fermata due volte: nel
+  prompt (regola 5), nel guardrail (`prepositional_object`) e normalizzata in
+  ogni caso allo stadio 1, perche' lo strip deve valere anche sui soggetti e su
+  tutto lo storico gia' estratto.
+- **Risolvere `the country` -> `Republic of Ireland` e' coreferenza, non
+  similarita'.** L'embedding di frase misura superficie: non lo sapra' mai fare.
+  Il posto giusto e' il prompt di DeepSeek, che ha il passaggio e il titolo
+  davanti — a differenza di fastcoref. Da qui la regola 3 (descrizioni definite,
+  non solo pronomi: `the country`/`the state` NON sono pronomi e passavano).
+- **Il vecchio prompt autorizzava esplicitamente il problema**: "or noun phrases
+  as they appear in the passage" licenziava `traditional centre ground` e
+  `fourth place`, e il divieto copriva solo i pronomi.
+- **Il loop di repair rende gratis ogni guardrail nuovo.** `_guard_and_repair`
+  rimanda a DeepSeek la frase col motivo dello scarto: aggiungere una reason in
+  `REASON_HINTS` la trasforma in una correzione di secondo giro senza scrivere
+  logica nuova.
+- **La NER e' il solo discrimine fra coordinazione e nome proprio.** A livello
+  di stringa "Trinidad and Tobago" e "Fianna Fail and Fine Gael" sono identici.
+  `en_core_web_sm` azzecca "Procter and Gamble" e "Bosnia and Herzegovina" ma
+  spacca "Trinidad and Tobago" in due GPE: aggiunto il TITOLO come secondo
+  segnale (match verbatim). Limite residuo accettato — la direzione di errore
+  voluta e' meno triple ma piu' precise.
+- **Splittare sulla virgola da sola bocciava triple legittime.** `January 9,
+  2007` diventava due entita'. Preso da un test esistente, non dal corpus: la
+  coordinazione ora richiede una congiunzione ESPLICITA (`and`/`&`), la virgola
+  separa solo dentro una coordinazione gia' accertata.
+- **`external_id` e' un identificatore, il nome del nodo e' un'etichetta.**
+  Erano la stessa stringa normalizzata, quindi `Labour Party (Ireland)` perdeva
+  `(Ireland)` — proprio cio' che lo distingue dal Labour Party britannico. Con
+  `scope=global` i due collassavano in silenzio, e l'ablazione `per_question` vs
+  `global` avrebbe misurato questo bug invece dell'effetto dello scope.
+- **Il Browser Neo4j mente per omissione.** `MATCH (n) RETURN n LIMIT 25` senza
+  ORDER BY restituisce gli id interni piu' bassi, cioe' i nodi scritti per
+  PRIMI: un contesto appena inserito non vi compare MAI e il grafo sembra non
+  aggiornato mentre invece lo e'. La UI ora stampa dopo ogni scrittura le query
+  Cypher filtrate sui `source_id` del contesto corrente.
+- **`delete_by_source` cancella solo gli archi.** I nodi `:Entity` orfani
+  sopravvivono al re-ingest e falsano il conteggio dei nodi. Query di pulizia
+  nella UI, sezione manutenzione.

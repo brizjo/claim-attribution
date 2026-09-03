@@ -33,23 +33,31 @@ REASON_HINTS = {
         "same year') — replace it with the full entity name stated in the "
         "sentence, or drop the triple",
     "generic_node":
-        "subject or object is a bare common noun ('game', 'teams') that "
-        "identifies nothing — use the specific named entity, date or number "
-        "from the sentence, or drop the triple",
+        "the subject is a bare common noun ('game', 'teams') that identifies "
+        "nothing — use the specific named entity, date or number from the "
+        "sentence, or drop the triple",
     "empty_subject": "subject is empty or meaningless — extract the real one",
     "empty_object": "object is empty or meaningless — extract the real one",
     "no_predicate":
-        "predicate carries no meaning ('is a', 'of') — use a short relation "
-        "that states the actual fact",
+        "predicate is empty — use a short relation that states the actual "
+        "fact",
     "entity_not_in_sentence":
-        "subject or object does not appear in the sentence — use ONLY "
-        "entities written in the sentence, never outside knowledge",
+        "subject or object appears neither in the sentence nor in the title "
+        "— use ONLY entities written there, never outside knowledge",
     "subject_is_claim":
         "subject is almost the whole sentence — an entity is a short noun "
         "phrase, not a clause",
     "object_is_claim":
         "object is almost the whole sentence — an entity is a short noun "
         "phrase, not a clause",
+    "prepositional_object":
+        "the object starts with a preposition ('in Ireland', 'on 25 "
+        "September') — the preposition belongs to the PREDICATE, not to the "
+        "node: move it there and leave the bare entity as the object",
+    "conjunction_mention":
+        "subject or object coordinates two different entities ('X and Y') — "
+        "that is two nodes, not one: emit one triple per entity, repeating "
+        "the predicate",
 }
 
 REPAIR_SYSTEM_PROMPT = """You are a precise information extraction engine. \
@@ -67,6 +75,13 @@ in the sentence. Never a pronoun, never a deictic phrase, never a bare \
 common noun.
 2. Subject and object must be different.
 3. The predicate is a short lowercase relation (2-4 words, no articles).
+4. The object carries no leading preposition — it belongs to the predicate.
+   ("Alpha", "was founded", "in Berlin") -> ("Alpha", "was founded in", "Berlin")
+5. One entity per field. A coordination is several entities: emit one triple \
+per entity, repeating the predicate. A proper name that merely contains \
+"and" ("Trinidad and Tobago") is ONE entity — do not split it.
+6. Dropping a triple is always allowed and often the right fix. Returning \
+fewer, sharper triples is better than forcing a bad one through.
 
 Answer with a single JSON object, no markdown, no commentary:
 {"triples": [{"subject": "...", "predicate": "...", "object": "..."}]}"""

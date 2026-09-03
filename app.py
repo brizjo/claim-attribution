@@ -88,6 +88,11 @@ st.markdown("""
 .span-label {
     color:#94a3b8; font-size:.82rem; font-style:italic;
     margin-top:4px; margin-bottom:8px; }
+.answer-box {
+    background:rgba(16,185,129,.08); border:1px solid rgba(16,185,129,.35);
+    border-left:5px solid #10b981; border-radius:0 12px 12px 0;
+    padding:1.2rem 1.4rem; margin:.8rem 0; color:#e2e8f0;
+    font-size:1.05rem; line-height:1.8; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -103,6 +108,7 @@ from src.ui.resources import (
     get_canonicalizer,
     get_debug_coref_resolver,
     get_deepseek,
+    get_generator,
     get_graph_writer,
     get_ingestor,
     get_neo4j_client,
@@ -239,6 +245,72 @@ def _render_triples(rows: list[dict], empty_msg: str) -> None:
                 f'<div class="span-label">source: {span}</div>',
                 unsafe_allow_html=True,
             )
+
+
+def _render_neo4j_browser_commands(selected, extractor: str) -> None:
+    """
+    Query Cypher da eseguire nel Neo4j Browser DOPO aver scritto un contesto.
+
+    Serve perche' la vista di default del Browser e' `MATCH (n) RETURN n
+    LIMIT 25`: senza ORDER BY restituisce i nodi con id interno piu' basso,
+    cioe' i PRIMI mai scritti nel database.  Un contesto appena inserito ha
+    gli id piu' alti e in quella vista non compare MAI — il grafo sembra non
+    essersi aggiornato mentre invece lo e'.  Le query qui sotto sono filtrate
+    sui `source_id` del contesto corrente, quindi mostrano esattamente cio'
+    che e' appena stato scritto.
+    """
+    source_ids = [str(chunk["source_id"]) for chunk in selected.docs()]
+    ids_literal = ", ".join(f"'{sid}'" for sid in source_ids)
+
+    st.markdown("**Da eseguire nel Neo4j Browser per vedere questo contesto**")
+    st.caption(
+        "La vista di default del Browser (`MATCH (n) RETURN n LIMIT 25`) mostra "
+        "i nodi scritti per PRIMI nel database, mai gli ultimi: un contesto "
+        "appena inserito non vi compare. Usa queste query."
+    )
+
+    st.code(
+        f"// 1. Il grafo di questo contesto ({len(source_ids)} passaggi)\n"
+        f"MATCH (s:Entity)-[r]->(o:Entity)\n"
+        f"WHERE r.source_id IN [{ids_literal}]\n"
+        f"  AND r.extractor = '{extractor}'\n"
+        f"RETURN s, r, o",
+        language="cypher",
+    )
+
+    st.code(
+        "// 2. Le stesse triple in tabella, per rileggerle una per una\n"
+        "MATCH (s:Entity)-[r]->(o:Entity)\n"
+        f"WHERE r.source_id IN [{ids_literal}]\n"
+        f"  AND r.extractor = '{extractor}'\n"
+        "RETURN s.name AS subject, r.predicate AS predicate, o.name AS object,\n"
+        "       r.source_id AS source_id, r.claim_span AS evidence\n"
+        "ORDER BY source_id, subject",
+        language="cypher",
+    )
+
+    with st.expander("Manutenzione del grafo (dopo un 'Force re-write')", expanded=False):
+        st.caption(
+            "`delete_by_source` cancella solo gli ARCHI: i nodi :Entity che "
+            "restano senza archi sopravvivono al re-ingest e falsano il "
+            "conteggio dei nodi. Da eseguire dopo ogni riscrittura forzata."
+        )
+        st.code(
+            "// Rimuove i nodi :Entity rimasti orfani da un re-ingest\n"
+            "MATCH (e:Entity)\n"
+            "WHERE NOT (e)--()\n"
+            "DELETE e",
+            language="cypher",
+        )
+        st.caption("Controllo di coerenza: nodi, archi e passaggi distinti.")
+        st.code(
+            "MATCH (e:Entity)\n"
+            "WITH count(e) AS nodes\n"
+            "MATCH (:Entity)-[r]->(:Entity)\n"
+            "RETURN nodes, count(r) AS relations,\n"
+            "       count(DISTINCT r.source_id) AS passages",
+            language="cypher",
+        )
 
 
 def _render_ingest_tab() -> None:
@@ -628,6 +700,8 @@ def _render_ingest_tab() -> None:
         for err in errors:
             st.error(err)
 
+        _render_neo4j_browser_commands(selected, ext_name)
+
     # Show existing graph triples for this question
     if neo4j and neo4j.is_connected():
         with st.expander("Graph triples for this question (from Neo4j)", expanded=False):
@@ -661,6 +735,103 @@ if tab_experiments is not None:
 # ──────────────────────────────────────────────────────────────────────
 
 with tab_claim:
+    # ================================================================
+    # GENERATOR — risposta grounded sui passaggi ground-truth ALCE
+    # (studio <claim, context>, stadio 1; gli stadi futuri estrarranno i
+    # claim dalla risposta e li inferiranno nel grafo — per ora la sezione
+    # convive qui, poi tutto confluira' in un'unica scheda.)
+    # ================================================================
+    st.markdown('<div class="step-header">Generator (DeepSeek) -- risposta grounded</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "<p style='color:#94a3b8;font-size:.9rem;'>"
+        "Il generatore risponde alla domanda ALCE usando <strong>solo</strong> "
+        "i 5 passaggi ground-truth (nessuna memoria di addestramento, nessuna "
+        "fonte esterna). In futuro: passaggi embeddati nel grafo, claim "
+        "estratti dalla risposta e verificati per inferenza."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    _gen_loader = get_alce_loader()
+    if not _gen_loader.exists():
+        st.error(f"Corpus ALCE non trovato: `{_gen_loader.path}`")
+    else:
+        gen_search = st.text_input(
+            "Filter questions",
+            placeholder="e.g. 'world cup', 'president', 'album'...",
+            key="gen_search",
+        )
+        gen_filtered = _gen_loader.search(gen_search, limit=200)
+        if not gen_filtered:
+            st.info("No questions match the filter.")
+        else:
+            gen_entry = st.selectbox(
+                "Question",
+                options=gen_filtered,
+                format_func=lambda e: e.question,
+                key="gen_question",
+            )
+            st.caption(f"sample_id: `{gen_entry.sample_id}` -- "
+                       f"{len(gen_entry.docs())} passaggi ground-truth")
+
+            _generator = get_generator()
+            if not _generator.is_available():
+                st.warning("`DEEPSEEK_API_KEY` non configurata -- vedi `.env`.")
+
+            generate_btn = st.button(
+                "Generate Answer",
+                type="primary",
+                disabled=not _generator.is_available(),
+                key="generate_btn",
+            )
+
+            if generate_btn:
+                from src.ingestion.output_store import save_generated_answer
+
+                with st.spinner("DeepSeek genera la risposta dai passaggi..."):
+                    try:
+                        ga = _generator.generate(
+                            gen_entry.question,
+                            gen_entry.docs(),
+                            sample_id=gen_entry.sample_id,
+                        )
+                    except Exception as exc:
+                        st.error(f"Generazione fallita: {exc}")
+                        ga = None
+
+                if ga is not None:
+                    st.session_state["generated_answer"] = ga
+                    save_generated_answer(
+                        sample_id=ga.sample_id,
+                        question=ga.question,
+                        answer=ga.answer,
+                        model=ga.model,
+                        seconds=ga.seconds,
+                        passages=ga.passages,
+                    )
+
+            _ga = st.session_state.get("generated_answer")
+            if _ga is not None and _ga.sample_id == gen_entry.sample_id:
+                st.markdown("#### Risposta del generatore")
+                st.markdown(f'<div class="answer-box">{_ga.answer}</div>',
+                            unsafe_allow_html=True)
+                st.caption(
+                    f"Model: `{_ga.model}` | {_ga.seconds:.1f}s | grounded sui "
+                    f"{len(_ga.passages)} passaggi qui sotto | salvata in "
+                    "`data/outputs/generated_answers.jsonl`"
+                )
+
+                st.markdown("#### Passaggi forniti al generatore (contesto integrale)")
+                for i, p in enumerate(_ga.passages, 1):
+                    title = p.get("title", p.get("source_file", "")) or "(untitled)"
+                    st.markdown(
+                        f"**[{i}] {title}**  --  source_id `{p.get('source_id', '')}`")
+                    st.markdown(f'<div class="chunk-box">{p.get("text", "")}</div>',
+                                unsafe_allow_html=True)
+
+    st.divider()
+
     st.markdown("### Verify Claim or Question")
     st.markdown(
         "<p style='color:#94a3b8;font-size:.9rem;'>"
