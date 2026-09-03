@@ -21,6 +21,23 @@ proprio a documentare questa decisione.
     * Il riferimento al documento (nome file, autore, data).
     * L'embedding vettoriale della stringa del predicato.
 
+**Guardrail + repair in pipeline (2026-09-03).** Ogni tripla estratta passa i
+guardrail (`src/ingestion/guardrails.py`: subject=object, nodi generici,
+deittici irrisolti, entita' non presenti nella frase, ...) DENTRO
+`AlceIngestor.extract_doc`. Le bocciate NON si buttano subito: tornano a
+DeepSeek — una chiamata per frase fallita, col motivo dello scarto
+(`src/ingestion/triple_repair.py`) — e le riparate ripassano gli stessi
+guardrail; chi fallisce due volte finisce in
+`data/outputs/triples_discarded.jsonl`. Un fallimento di fastcoref sul singolo
+passaggio degrada al testo originale (`coref_failed`) invece di perdere il
+passaggio: i guardrail fanno da rete. UI e batch usano lo STESSO
+`extract_doc`: mai ri-implementare l'estrazione inline.
+
+**Ingestione batch:** `scripts/ingest_alce.py` (template della pipeline:
+health check fail-fast -> extract -> guardrail+repair -> canonicalize ->
+write). Neo4j: istanza Desktop "RAG", `bolt://localhost:7687`, database
+`neo4j`, credenziali in `.env`.
+
 ### Fase 1-bis: Canonicalizzazione delle entita' (fra estrazione e scrittura)
 La pipeline ha tre fasi, non due: `extract_entry` -> `canonicalize_entry` ->
 `write_entry` (`src/ingestion/entity_canonicalizer.py`).  Il momento giusto per

@@ -32,12 +32,17 @@ def get_alce_loader():
 
 
 @st.cache_resource
-def get_ingestor(extractor_name: str):
-    """Un ingestor per estrattore — tiene caldi i client fra le run."""
+def get_ingestor(extractor_name: str, use_coref: bool = True):
+    """Un ingestor per (estrattore, coref) — tiene caldi i client fra le run.
+
+    Il resolver e' CONDIVISO (`get_debug_coref_resolver`): fastcoref viene
+    caricato una volta sola anche se esistono piu' ingestor cached."""
     from src.ingestion.alce_ingestor import AlceIngestor, build_extractor
     return AlceIngestor(
         client=get_neo4j_client(),
         extractor=build_extractor(extractor_name),
+        resolver=get_debug_coref_resolver(),
+        use_coref=use_coref,
     )
 
 

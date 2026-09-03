@@ -373,60 +373,43 @@ def _render_ingest_tab() -> None:
     )
 
     if extract_btn:
-        import time
-        from src.ingestion.span_matcher import best_span
-        from src.ingestion.output_store import save_coref
-
-        extractor_obj = get_deepseek()
-        resolver = get_debug_coref_resolver()
+        # Pipeline REALE (`AlceIngestor.extract_doc`): coref -> frasi ->
+        # DeepSeek -> guardrail (+ repair round) -> claim_span dalla frase
+        # originale allineata.  Stessa strada di `scripts/ingest_alce.py` —
+        # la UI non ri-implementa piu' l'estrazione inline (prima saltava
+        # sentence split e guardrail: le triple corrotte finivano in grafo).
+        ingestor = get_ingestor(active_extractor, use_coref=not skip_coref)
         results = []
 
         with st.status(f"{active_extractor}: extracting triples...", expanded=True) as stage:
             for chunk in selected.docs():
-                original = chunk.get("text", "")
-                sid = chunk["source_id"]
-                stage.update(label=f"Processing source_id={sid}...")
-
-                # Coref
-                if not skip_coref:
-                    resolved = resolver.resolve(original)
-                else:
-                    resolved = original
-
-                # Save coref to JSONL
-                save_coref(
-                    source_id=sid,
-                    sample_id=selected.sample_id,
-                    title=chunk.get("title", ""),
-                    chunk_index=chunk.get("chunk_index", 0),
-                    original_text=original,
-                    resolved_text=resolved,
-                )
-
-                # Extract
-                t0 = time.time()
-                raw = extractor_obj.extract([{**chunk, "text": resolved}])
-                elapsed = time.time() - t0
-
-                triples = [
-                    t._replace(chunk_text=original, claim_span=best_span(original, t.subject, t.obj))
-                    for t in raw
-                ]
-
+                stage.update(label=f"Processing source_id={chunk['source_id']}...")
+                doc = ingestor.extract_doc(chunk, sample_id=selected.sample_id)
+                if doc.error:
+                    stage.update(label=f"Errore su {doc.source_id}: {doc.error}",
+                                 state="error")
                 results.append({
-                    "source_id": sid,
-                    "chunk_index": chunk.get("chunk_index", 0),
-                    "title": chunk.get("title", ""),
-                    "original_text": original,
-                    "resolved_text": resolved,
-                    "triples": triples,
-                    "elapsed": elapsed,
+                    "source_id": doc.source_id,
+                    "chunk_index": doc.chunk_index,
+                    "title": doc.title,
+                    "original_text": doc.original_text,
+                    "resolved_text": doc.resolved_text,
+                    "triples": doc.triples,
+                    "elapsed": doc.seconds,
+                    "discarded": doc.discarded,
+                    "repaired": doc.repaired,
+                    "coref_failed": doc.coref_failed,
+                    "error": doc.error,
                 })
 
             total = sum(len(r["triples"]) for r in results)
+            n_repaired = sum(r["repaired"] for r in results)
+            n_discarded = sum(len(r["discarded"]) for r in results)
             total_t = sum(r["elapsed"] for r in results)
             stage.update(
-                label=f"Done: {total} triples total, {total_t:.3f}s ({active_extractor})",
+                label=(f"Done: {total} triple ({n_repaired} riparate), "
+                       f"{n_discarded} scartate dai guardrail, "
+                       f"{total_t:.1f}s ({active_extractor})"),
                 state="complete",
             )
 
@@ -466,11 +449,25 @@ def _render_ingest_tab() -> None:
         ext_label = extract_data["extractor"]
         total_triples = sum(len(r["triples"]) for r in extract_data["results"])
         total_time = sum(r["elapsed"] for r in extract_data["results"])
+        total_repaired = sum(r.get("repaired", 0) for r in extract_data["results"])
+        total_discarded = sum(len(r.get("discarded", []))
+                              for r in extract_data["results"])
         st.caption(
             f"Extractor: `{ext_label}` | "
-            f"Total triples: {total_triples} | "
+            f"Total triples: {total_triples} "
+            f"(riparate: {total_repaired}) | "
+            f"Scartate dai guardrail: {total_discarded} "
+            "(`data/outputs/triples_discarded.jsonl`) | "
             f"Total time: {total_time:.3f}s"
         )
+        coref_failed_ids = [r["source_id"] for r in extract_data["results"]
+                            if r.get("coref_failed")]
+        if coref_failed_ids:
+            st.warning(
+                "Coref FALLITA su: " + ", ".join(coref_failed_ids) +
+                " — usato il testo originale; i guardrail hanno scartato "
+                "i riferimenti irrisolti."
+            )
 
         for r in extract_data["results"]:
             with st.expander(
@@ -491,6 +488,19 @@ def _render_ingest_tab() -> None:
                     for t in r["triples"]
                 ]
                 _render_triples(rows, "-- no triples extracted")
+
+                if r.get("discarded"):
+                    st.markdown(
+                        f"**Scartate dai guardrail ({len(r['discarded'])})**")
+                    st.dataframe(
+                        [
+                            {"stage": d["stage"], "reason": d["discard_reason"],
+                             "subject": d["subject"], "predicate": d["predicate"],
+                             "object": d["object"]}
+                            for d in r["discarded"]
+                        ],
+                        use_container_width=True, hide_index=True,
+                    )
     else:
         st.caption("No extraction results yet. Run Step 4 first.")
 

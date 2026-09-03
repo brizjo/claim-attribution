@@ -2,8 +2,9 @@
 ALCE Ingestor — orchestrates the pipeline on ALCE passages.
 
 For each passage:
-    skip-check -> coref -> triple extraction -> anchor claim_span on ORIGINAL
-    text -> (optionally) embed predicates -> MERGE into Neo4j -> registry
+    skip-check -> coref -> sentence split -> triple extraction -> GUARDRAILS
+    (+ un round di repair DeepSeek sulle bocciate) -> claim_span dalla frase
+    ORIGINALE allineata -> canonicalize -> MERGE into Neo4j -> registry
 
 Three-phase architecture (canonicalization added 2026-09-03):
     1. extract_doc / extract_entry  — coref + extraction, produces DocResult
@@ -31,6 +32,7 @@ from typing import Callable, Optional, Protocol
 
 from config import settings
 from src.graph.neo4j_client import Neo4jClient
+from src.ingestion import guardrails, triple_repair
 from src.ingestion.alce_loader import AlceEntry
 from src.ingestion.coref_resolver import CoreferenceResolver
 from src.ingestion.entity_canonicalizer import (
@@ -38,9 +40,13 @@ from src.ingestion.entity_canonicalizer import (
     EntityCanonicalizer,
 )
 from src.ingestion.graph_writer import GraphWriter
-from src.ingestion.output_store import save_coref, save_triples_batch
+from src.ingestion.output_store import (
+    save_coref,
+    save_discarded_triples,
+    save_triples_batch,
+)
 from src.ingestion.processed_registry import ProcessedRegistry
-from src.ingestion.span_matcher import best_span
+from src.ingestion.span_matcher import align_sentences, best_span
 from src.ingestion.triple_extractor import Triple
 
 logger = logging.getLogger(__name__)
@@ -73,6 +79,14 @@ class DocResult:
     error: str = ""
     seconds: float = 0.0
     extract_seconds: float = 0.0  # extractor.extract() only, no coref/embed/write
+    # Guardrail in pipeline (2026-09-03): triple bocciate (dict con
+    # discard_reason + stage "extract"|"repair") e quante sono state
+    # recuperate dal round di riparazione DeepSeek.
+    discarded: list[dict] = field(default_factory=list)
+    repaired: int = 0
+    # La coref e' fallita su QUESTO passaggio: si e' proseguito col testo
+    # originale e i guardrail hanno fatto da rete (unresolved_reference).
+    coref_failed: bool = False
 
     @property
     def zero_triples(self) -> bool:
@@ -104,6 +118,14 @@ class IngestReport:
     def zero_triple_docs(self) -> list[DocResult]:
         return [d for d in self.docs if d.zero_triples]
 
+    @property
+    def total_discarded(self) -> int:
+        return sum(len(d.discarded) for d in self.docs)
+
+    @property
+    def total_repaired(self) -> int:
+        return sum(d.repaired for d in self.docs)
+
 
 class AlceIngestor:
     """Ingests an ALCE entry into the graph with a specific extractor."""
@@ -116,6 +138,7 @@ class AlceIngestor:
         registry: Optional[ProcessedRegistry] = None,
         use_coref: bool = True,
         canonicalizer: Optional[EntityCanonicalizer] = None,
+        anchorer: Optional[guardrails.EntityAnchorer] = None,
     ):
         self._client = client
         self._extractor = extractor
@@ -126,6 +149,7 @@ class AlceIngestor:
         self._writer = GraphWriter(client=client) if client else None
         self._use_coref = use_coref
         self._nlp = None  # lazy-loaded spaCy model for sentence splitting
+        self._anchorer = anchorer  # guardrail generic_node (spaCy NER/POS)
 
     def _get_nlp(self):
         """Lazily load the spaCy model (reused across calls)."""
@@ -142,6 +166,21 @@ class AlceIngestor:
                     settings.SPACY_MODEL,
                 )
         return self._nlp
+
+    def _get_anchorer(self) -> guardrails.EntityAnchorer:
+        """Anchorer per il guardrail `generic_node`.
+
+        Riusa lo spaCy dell'ingestor se ha la NER; il fallback "blank
+        sentencizer" di `_get_nlp` NON basta (senza NER ogni entita'
+        risulterebbe generica) — in quel caso si usa `default_anchorer`,
+        che fallisce rumorosamente se il modello manca."""
+        if self._anchorer is None:
+            nlp = self._get_nlp()
+            if "ner" in getattr(nlp, "pipe_names", []):
+                self._anchorer = guardrails.EntityAnchorer(nlp=nlp)
+            else:
+                self._anchorer = guardrails.default_anchorer()
+        return self._anchorer
 
     @property
     def extractor_name(self) -> str:
@@ -245,10 +284,26 @@ class AlceIngestor:
 
         t0 = time.time()
         try:
-            # 1. Coref on original text.
+            # 1. Coref on original text.  GUARDRAIL (2026-09-03): un bug di
+            #    fastcoref su UN passaggio non deve piu' uccidere il passaggio
+            #    intero — si prosegue col testo originale, si marca
+            #    `coref_failed` e i guardrail a valle (`unresolved_reference`)
+            #    scartano i deittici rimasti.  Il check globale "fastcoref non
+            #    carica affatto" resta nel runner batch (exit 2).
             if progress:
                 progress(f"{self.extractor_name}: coreference on {source_id}...")
-            resolved = self._resolver.resolve(original) if self._use_coref else original
+            resolved = original
+            if self._use_coref:
+                try:
+                    resolved = self._resolver.resolve(original)
+                except Exception as exc:
+                    result.coref_failed = True
+                    logger.error(
+                        "Coref FALLITA su source_id=%s (%s: %s) — si prosegue "
+                        "col testo ORIGINALE; i guardrail scartano i "
+                        "riferimenti irrisolti.",
+                        source_id, type(exc).__name__, exc,
+                    )
             result.resolved_text = resolved
 
             # Save coref result to JSONL
@@ -265,7 +320,8 @@ class AlceIngestor:
             if progress:
                 progress(f"{self.extractor_name}: extracting {source_id}...")
             t_extract = time.time()
-            sents = [s.text.strip() for s in self._get_nlp()(resolved).sents
+            nlp = self._get_nlp()
+            sents = [s.text.strip() for s in nlp(resolved).sents
                      if s.text.strip()]
             if not sents:
                 sents = [resolved]
@@ -273,16 +329,27 @@ class AlceIngestor:
             raw_triples = self._extractor.extract(sent_chunks)
             result.extract_seconds = time.time() - t_extract
 
-            # 3. chunk_text = ORIGINAL text (evidence must be verbatim);
-            #    claim_span anchored to original.
-            triples = [
+            # 3. Guardrail + repair round (una sola ripetizione, mai un loop).
+            if progress and raw_triples:
+                progress(f"{self.extractor_name}: guardrails on {source_id}...")
+            kept = self._guard_and_repair(result, chunk, raw_triples)
+
+            # 4. chunk_text = ORIGINAL text (evidence must be verbatim);
+            #    claim_span = frase ORIGINALE allineata alla frase risolta
+            #    da cui la tripla e' uscita (best_span solo come fallback).
+            orig_sents = [s.text.strip() for s in nlp(original).sents
+                          if s.text.strip()]
+            sent_map = {res: orig
+                        for orig, res in align_sentences(orig_sents, sents)}
+            result.triples = [
                 t._replace(
                     chunk_text=original,
-                    claim_span=best_span(original, t.subject, t.obj, t.claim_span),
+                    claim_span=(sent_map.get(t.chunk_text)
+                                or best_span(original, t.subject, t.obj,
+                                             t.claim_span)),
                 )
-                for t in raw_triples
+                for t in kept
             ]
-            result.triples = triples
 
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
@@ -290,6 +357,117 @@ class AlceIngestor:
 
         result.seconds = time.time() - t0
         return result
+
+    # ────────────────────────────────────────────────────────────────
+    # Guardrail + repair (dentro extract_doc, prima dello span)
+    # ────────────────────────────────────────────────────────────────
+
+    def _discard_record(  # noqa: PLR0913
+        self, result: DocResult, subject: str, predicate: str, obj: str,
+        sentence: str, reason: str, stage: str,
+    ) -> dict:
+        return {
+            "sample_id": result.sample_id,
+            "source_id": result.source_id,
+            "title": result.title,
+            "chunk_index": result.chunk_index,
+            "extractor": self.extractor_name,
+            "sentence": sentence,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
+            "discard_reason": reason,
+            "stage": stage,
+        }
+
+    def _guard_and_repair(
+        self, result: DocResult, chunk: dict, raw_triples: list[Triple],
+    ) -> list[Triple]:
+        """
+        Guardrail sulle triple grezze + UN round di riparazione DeepSeek.
+
+        Portato dagli esperimenti alla pipeline principale (2026-09-03): le
+        classi di corruzione osservate (subject=object, nodi generici,
+        deittici irrisolti, entita' inventate) finivano dritte in Neo4j.
+        Le bocciate NON si buttano subito: tornano a DeepSeek — una chiamata
+        per frase fallita, col motivo dello scarto — e le riparate ripassano
+        gli STESSI guardrail.  Chi fallisce due volte muore, loggato in
+        `data/outputs/triples_discarded.jsonl`.
+
+        La frase di verifica e' `t.chunk_text`: la frase coref-RISOLTA data
+        all'estrattore (lo span verbatim sull'originale si assegna dopo).
+        """
+        anchorer = self._get_anchorer()
+        kept: list[Triple] = []
+        failed: dict[str, list[tuple[Triple, str]]] = {}
+        for t in raw_triples:
+            sentence = t.chunk_text
+            verdict = guardrails.check(
+                t.subject, t.predicate, t.obj, sentence, anchorer=anchorer)
+            if verdict.ok:
+                kept.append(t)
+            else:
+                failed.setdefault(sentence, []).append((t, verdict.reason))
+
+        records: list[dict] = []
+        title = chunk.get("title", chunk.get("source_file", ""))
+        # Il Protocol `Extractor` non impone un client LLM: gli stub dei test
+        # e gli estrattori sperimentali senza `.client` saltano il repair.
+        repair_client = getattr(self._extractor, "client", None)
+
+        for sentence, fails in failed.items():
+            rejected = [
+                {"subject": t.subject, "predicate": t.predicate,
+                 "obj": t.obj, "reason": reason}
+                for t, reason in fails
+            ]
+            for t, reason in fails:
+                records.append(self._discard_record(
+                    result, t.subject, t.predicate, t.obj, sentence,
+                    reason, "extract"))
+            if repair_client is None:
+                continue
+            for item in triple_repair.repair_sentence(
+                    repair_client, sentence, title, rejected):
+                verdict = guardrails.check(
+                    item["subject"], item["predicate"], item["obj"],
+                    sentence, anchorer=anchorer)
+                if verdict.ok:
+                    result.repaired += 1
+                    kept.append(Triple(
+                        subject=item["subject"],
+                        predicate=item["predicate"],
+                        obj=item["obj"],
+                        chunk_text=sentence,
+                        source_file=chunk.get("source_file", ""),
+                        chunk_index=chunk.get("chunk_index", 0),
+                        source_id=result.source_id,
+                        extractor=self.extractor_name,
+                        claim_span=item.get("claim_span", ""),
+                    ))
+                else:
+                    records.append(self._discard_record(
+                        result, item["subject"], item["predicate"],
+                        item["obj"], sentence, verdict.reason, "repair"))
+
+        # Dedup su (S, P, O): il repair puo' ri-emettere una tripla gia' tenuta
+        # e la stessa tripla puo' uscire da due frasi dello stesso passaggio.
+        deduped: list[Triple] = []
+        seen: set[tuple[str, str, str]] = set()
+        for t in kept:
+            key = (t.subject.lower(), t.predicate.lower(), t.obj.lower())
+            if key in seen:
+                records.append(self._discard_record(
+                    result, t.subject, t.predicate, t.obj, t.chunk_text,
+                    "duplicate", "dedup"))
+                continue
+            seen.add(key)
+            deduped.append(t)
+
+        result.discarded = records
+        if records:
+            save_discarded_triples(records)
+        return deduped
 
     # ────────────────────────────────────────────────────────────────
     # Phase 2: Canonicalize (nodi unificati + predicate_embedding, NO Neo4j)

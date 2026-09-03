@@ -9,6 +9,8 @@ Produced files (under settings.OUTPUT_DIR):
 
     coref_resolved.jsonl        original + resolved text per passage
     triples_extracted.jsonl     each (S, P, O) + claim_span + source_id
+    triples_discarded.jsonl     triple bocciate dai guardrail della pipeline
+                                principale (+ discard_reason, stage)
     attribution_results.jsonl   claim attribution outcomes
     ingest_reports.jsonl        per-question ingestion summaries
     canonicalization.jsonl      una riga per menzione: forma originale -> forma
@@ -179,6 +181,25 @@ def save_ingest_report(
         "errors": errors,
         "timestamp": _timestamp(),
     })
+
+
+def save_discarded_triples(records: list[dict]) -> int:
+    """
+    Persiste le triple scartate dai guardrail della pipeline PRINCIPALE
+    (una riga per tripla, con `discard_reason` e `stage`: "extract" se
+    bocciata alla prima passata, "repair" se bocciata anche dopo la
+    riparazione DeepSeek).  File separato da `triples_hybrid_discarded.jsonl`,
+    che appartiene agli esperimenti.
+    """
+    if not records:
+        return 0
+    path = _BASE / "triples_discarded.jsonl"
+    _ensure_dir(path)
+    ts = _timestamp()
+    with path.open("a", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps({**record, "timestamp": ts}, ensure_ascii=False) + "\n")
+    return len(records)
 
 
 # ── Canonicalizzazione delle entita' (fase pre-write) ─────────────────

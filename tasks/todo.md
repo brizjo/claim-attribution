@@ -295,6 +295,47 @@ Vocabolario REBEL ricavato dall'output: 117 predicati distinti.
 - [ ] Il grafo esistente NON e' migrato: va rigenerato per avere
       `surface_form`/`external_id` sugli archi e sui nodi.
 
+## Phase 17: Guardrail in pipeline + repair DeepSeek + Neo4j batch (2026-09-03)
+
+Contesto: i guardrail (subject=object, generic_node, unresolved_reference...)
+vivevano SOLO negli esperimenti — la pipeline principale scriveva su Neo4j
+triple corrotte. fastcoref inoltre ogni tanto fallisce a runtime e l'errore
+uccideva l'intero passaggio.
+
+- [x] `src/ingestion/triple_repair.py` — prompt di riparazione: le triple
+      bocciate dai guardrail vengono RIMANDATE a DeepSeek (1 call per frase
+      fallita) con il motivo dello scarto tradotto in istruzione correttiva;
+      le riparate ripassano gli STESSI guardrail (UN round, mai un loop).
+- [x] `alce_ingestor.extract_doc` — guardrail su ogni tripla (frase coref-
+      risolta come sorgente), repair round, dedup (S,P,O), claim_span dalla
+      frase ORIGINALE allineata via `align_sentences` (best_span fallback).
+      `DocResult`: nuovi campi `discarded` / `repaired` / `coref_failed`.
+- [x] Coref guardrail: fallimento per-passaggio -> log + testo originale +
+      `coref_failed=True` (il guardrail `unresolved_reference` para i deittici).
+      Health check globale resta nel runner batch (exit 2).
+- [x] `output_store.save_discarded_triples` -> `triples_discarded.jsonl`
+      (stage `extract` | `repair` | `dedup` + `discard_reason`).
+- [x] `scripts/ingest_alce.py` — template batch: health checks fail-fast
+      (coref exit 2 / DeepSeek exit 3 / Neo4j exit 4) -> extract ->
+      guardrail+repair -> canonicalize -> write. Flag: `--limit`,
+      `--sample-id`, `--force`, `--dry-run`, `--scope`, `--no-coref`.
+- [x] UI Step 4 riscritto su `AlceIngestor.extract_doc`: PRIMA ri-implementava
+      l'estrazione inline (passaggio intero, niente sentence split, niente
+      guardrail) — le triple corrotte finivano in grafo dal percorso UI.
+      Step 5 mostra riparate/scartate + tabella scarti per passaggio.
+- [x] Verifica Neo4j live (istanza Desktop "RAG", bolt://localhost:7687,
+      db `neo4j`, credenziali in `.env`): connessione ok, grafo vuoto.
+- [x] Run live `--limit 1`: 40 triple tenute, 23 scartate (duplicate 12,
+      generic_node 5, entity_not_in_sentence 3, no_predicate 2,
+      unresolved_reference 1), 40 scritte, grafo 30 nodi / 34 archi
+      (6 collassi MERGE post-canonicalizzazione). Ri-run: 5/5 skip,
+      grafo invariato (idempotenza confermata).
+- [x] `tests/test_ingest_guardrails.py` — 7 test senza rete (stub extractor/
+      client/resolver/anchorer): repair riuscito, repair ri-bocciato,
+      estrattore senza client, generic_node, coref_failed, dedup, span
+      allineato. Suite: 84 test passati (escluso `test_rag_rewardbench.py`,
+      rotto dal primo commit: `BERTSCORE_MODEL` inesistente).
+
 ## REBEL fuori dalla pipeline principale (2026-09-03)
 
 Estrattore unico: DeepSeek. REBEL resta solo negli esperimenti (il loro scopo

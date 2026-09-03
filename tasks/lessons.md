@@ -277,6 +277,44 @@
   `src/ui/resources.py`: due `@st.cache_resource` con lo stesso corpo ma in
   moduli diversi sono due cache diverse, cioe' REBEL caricato due volte.
 
+## Fase 17 — Guardrail in pipeline + repair + Neo4j batch (2026-09-03)
+
+- **I guardrail erano solo negli esperimenti: la pipeline principale scriveva
+  su Neo4j le stesse classi di corruzione misurate là** (subject=object, nodi
+  generici, deittici, entita' inventate). Il run live lo conferma: 11 triple
+  su 51 bocciate alla prima domanda ingerita. *Lezione: un fix validato in un
+  esperimento non esiste finche' non e' portato nel percorso di produzione —
+  e i due percorsi vanno tenuti UNO.*
+- **La UI ri-implementava l'estrazione inline** (`app.py` Step 4: passaggio
+  intero all'estrattore, niente sentence split, niente guardrail, best_span
+  senza allineamento): il percorso UI e il percorso batch producevano triple
+  DIVERSE dallo stesso input. Ora entrambi passano da
+  `AlceIngestor.extract_doc`. *Lezione: se un bottone della UI e uno script
+  batch fanno "la stessa cosa" con due implementazioni, una delle due e' gia'
+  sbagliata — cercare sempre la duplicazione del flusso, non solo del codice.*
+- **Le triple bocciate non si buttano: si riparano.** Il repair round (1 call
+  DeepSeek per frase fallita, col motivo dello scarto tradotto in istruzione
+  correttiva) recupera i fatti con la forma rotta; le riparate ripassano gli
+  STESSI guardrail e chi fallisce due volte muore (`stage="repair"` nel log).
+  Nel run live DeepSeek ha correttamente lasciato cadere le irreparabili
+  (0 riparate su 11): il costo e' basso perche' si paga solo per le frasi con
+  almeno uno scarto, e la cache LLM copre i ri-run.
+- **Un bug di fastcoref su UN passaggio non deve uccidere il passaggio.**
+  `extract_doc` ora degrada al testo originale marcando `coref_failed`, e il
+  guardrail `unresolved_reference` scarta i deittici rimasti: prima l'intero
+  passaggio finiva in `error` e si perdevano anche le triple buone. Il
+  fail-fast globale (fastcoref non carica affatto) resta nel runner batch
+  (exit 2): degradare per-passaggio e' sicuro SOLO perche' ora i guardrail
+  fanno da rete a valle.
+- **`getattr(extractor, "client", None)` tiene il Protocol pulito**: il repair
+  serve solo all'estrattore LLM; stub dei test ed estrattori sperimentali
+  senza `.client` saltano il repair senza cambiare l'interfaccia `Extractor`.
+- **Neo4j (2026-09-03)**: istanza Desktop "RAG", `bolt://localhost:7687`,
+  database `neo4j`, credenziali in `.env`. 40 triple scritte -> 34 archi: la
+  differenza sono MERGE collassati DOPO la canonicalizzazione (stessa chiave
+  `(predicate, source_id, extractor)` fra gli stessi nodi canonici) — e'
+  idempotenza che lavora, non triple perse. Ri-run: 5/5 skip, grafo invariato.
+
 ## REBEL fuori dalla pipeline principale (2026-09-03)
 
 - **Decisione presa sui numeri, non a sensazione.** L'esperimento ibrido esisteva
